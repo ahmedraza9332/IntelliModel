@@ -34,24 +34,19 @@ const TeamSection = () => {
 
   const teamMembers = [
     {
-      name: "Team Member 1",
+      name: "Ahmed Raza",
       role: "Project Lead & ML Engineer",
       image: "/lovable-uploads/22d31f51-c174-40a7-bd95-00e4ad00eaf3.png"
     },
     {
-      name: "Team Member 2",
+      name: "Fatimah Ansari",
       role: "Backend Developer",
       image: "/lovable-uploads/5663820f-6c97-4492-9210-9eaa1a8dc415.png"
     },
     {
-      name: "Team Member 3",
+      name: "Arisha Rehan Chotani",
       role: "Frontend Developer",
       image: "/lovable-uploads/af412c03-21e4-4856-82ff-d1a975dc84a9.png"
-    },
-    {
-      name: "Team Member 4",
-      role: "Data Scientist",
-      image: "/lovable-uploads/c3d5522b-6886-4b75-8ffc-d020016bb9c2.png"
     }
   ];
 
@@ -77,7 +72,7 @@ const TeamSection = () => {
         </div>
 
         <div className="max-w-6xl mx-auto">
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-8">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
             {teamMembers.map((member, index) => (
               <div 
                 key={index}
