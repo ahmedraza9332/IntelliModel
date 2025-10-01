@@ -35,7 +35,7 @@ const DemoSection = () => {
 
   const downloads = [
     { title: "Profiling Report", description: "Comprehensive dataset analysis", filename: "profiling_report.pdf" },
-    { title: "Cleaned Dataset", description: "Preprocessed and feature-engineered data", filename: "cleaned_dataset.csv" },
+    { title: "Cleaned Dataset", description: "Feature-engineered data", filename: "cleaned_dataset.csv" },
     { title: "Validation Results", description: "Model performance metrics and analysis", filename: "validation_results.pdf" }
   ];
 
