@@ -54,11 +54,9 @@ const Navbar = () => {
           }}
           aria-label="IntelliModel"
         >
-          <img 
-            src="/intellimodel-logo.png" 
-            alt="IntelliModel Logo"
-            className="h-7 sm:h-8"
-          />
+          <span className="text-xl sm:text-2xl font-bold text-foreground">
+            IntelliModel
+          </span>
         </a>
 
         {/* Desktop Navigation */}
