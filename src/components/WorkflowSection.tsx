@@ -37,7 +37,7 @@ const WorkflowSection = () => {
     { id: 2, name: "Profiling", icon: "🔍" },
     { id: 3, name: "Preprocessing", icon: "🧹" },
     { id: 4, name: "Model Suggestion", icon: "🤖" },
-    { id: 5, name: "Training & Validation", icon: "🎯" },
+    { id: 5, name: "Validation Testing", icon: "🎯" },
     { id: 6, name: "Improvement Agent", icon: "⚡" },
     { id: 7, name: "User Approval", icon: "✓" },
     { id: 8, name: "Deployment", icon: "🚀" },
