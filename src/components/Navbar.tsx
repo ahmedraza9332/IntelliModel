@@ -55,9 +55,9 @@ const Navbar = () => {
           aria-label="IntelliModel"
         >
           <img 
-            src="/logo.svg" 
+            src="/intellimodel-logo.png" 
             alt="IntelliModel Logo"
-            className="h-7 sm:h-8" 
+            className="h-7 sm:h-8"
           />
         </a>
 
