@@ -1,5 +1,6 @@
 
 import React, { useEffect } from "react";
+import { useLocation } from "react-router-dom";
 import Navbar from "@/components/Navbar";
 import Hero from "@/components/Hero";
 import AboutSection from "@/components/AboutSection";
@@ -10,6 +11,7 @@ import Newsletter from "@/components/Newsletter";
 import Footer from "@/components/Footer";
 
 const Index = () => {
+  const location = useLocation();
   // Initialize intersection observer to detect when elements enter viewport
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -54,6 +56,34 @@ const Index = () => {
       });
     });
   }, []);
+
+  useEffect(() => {
+    if (!location.hash) {
+      return;
+    }
+
+    const handleHashNavigation = () => {
+      const targetElement = document.querySelector(location.hash);
+      if (!targetElement) {
+        return;
+      }
+
+      const offset = window.innerWidth < 768 ? 100 : 80;
+      const elementPosition =
+        (targetElement as HTMLElement).getBoundingClientRect().top +
+        window.scrollY -
+        offset;
+
+      window.scrollTo({
+        top: elementPosition,
+        behavior: "smooth"
+      });
+    };
+
+    const timeout = window.setTimeout(handleHashNavigation, 150);
+
+    return () => window.clearTimeout(timeout);
+  }, [location]);
 
   return (
     <div className="min-h-screen">
