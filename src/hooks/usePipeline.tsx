@@ -55,9 +55,29 @@ export const usePipeline = (pipelineId: string | null) => {
     initializedRef.current = null;
   }, []);
 
+  // Proceed to next step (user-driven advancement)
+  const proceedToNextStep = useCallback(() => {
+    pipelineService.proceedToNextStep();
+    // Refresh state after proceeding
+    const newState = pipelineService.getState();
+    if (newState) {
+      setState({ ...newState });
+    }
+  }, []);
+
   // Get milestone by ID
   const getMilestone = useCallback((milestoneId: string): PipelineMilestone | undefined => {
     return pipelineService.getMilestone(milestoneId);
+  }, []);
+
+  // Complete milestone manually (for external events)
+  const completeMilestone = useCallback((milestoneId: string) => {
+    pipelineService.completeMilestone(milestoneId);
+    // Refresh state after completing
+    const newState = pipelineService.getState();
+    if (newState) {
+      setState({ ...newState });
+    }
   }, []);
 
   return {
@@ -65,7 +85,9 @@ export const usePipeline = (pipelineId: string | null) => {
     startPipeline,
     stopPipeline,
     resetPipeline,
+    proceedToNextStep,
     getMilestone,
+    completeMilestone,
     isInitialized: initializedRef.current !== null,
   };
 };

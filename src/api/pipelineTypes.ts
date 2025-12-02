@@ -14,18 +14,30 @@ export interface PipelineMilestone {
   error?: string;
 }
 
+export type PipelineFlowState = 
+  | "UPLOAD" 
+  | "PREPROCESS" 
+  | "RECOMMENDATION_WAIT"
+  | "TRAINING" 
+  | "METRICS_WAIT"
+  | "IMPROVEMENT" 
+  | "IMPROVEMENT_WAIT"
+  | "DEPLOYMENT";
+
 export interface PipelineState {
   pipelineId: string;
   milestones: PipelineMilestone[];
   overallProgress: number; // 0-100
   currentStage: string | null;
-  status: "idle" | "running" | "completed" | "failed";
+  status: "idle" | "running" | "completed" | "failed" | "waiting";
+  flowState: PipelineFlowState | null;
   startedAt?: string;
   completedAt?: string;
+  waitingForUser: boolean;
 }
 
 export interface PipelineEvent {
-  type: "milestone_started" | "milestone_completed" | "milestone_failed" | "pipeline_completed" | "pipeline_failed";
+  type: "milestone_started" | "milestone_completed" | "milestone_failed" | "pipeline_started" | "pipeline_completed" | "pipeline_failed" | "pipeline_waiting" | "pipeline_resumed";
   milestoneId?: string;
   timestamp: string;
   data?: any;
