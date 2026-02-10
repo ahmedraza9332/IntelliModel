@@ -55,26 +55,18 @@ const DemoSection = () => {
         </div>
 
         <h2 className="section-title text-center mb-4 opacity-0 fade-in-element">
-          See IntelliModel in Action
+          Why IntelliModel
         </h2>
-        <p className="section-subtitle text-center mx-auto mb-16 opacity-0 fade-in-element">
-          Watch how our intelligent agents automate the entire ML pipeline
-        </p>
-
         <div className="max-w-5xl mx-auto">
-          {/* Video placeholder */}
+          {/* Video */}
           <div className="aspect-video w-full bg-gradient-to-br from-gray-800 to-gray-900 rounded-3xl shadow-2xl mb-12 opacity-0 fade-in-element overflow-hidden">
-            <div className="w-full h-full flex flex-col items-center justify-center p-8 text-center">
-              <div className="w-20 h-20 mb-6 rounded-full bg-pulse-500/20 flex items-center justify-center">
-                <svg className="w-10 h-10 text-pulse-500" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M8 5v14l11-7z"/>
-                </svg>
-              </div>
-              <h3 className="text-2xl font-bold text-white mb-3">Demo Video Coming Soon</h3>
-              <p className="text-gray-300 text-lg max-w-md">
-                Watch a complete walkthrough of IntelliModel processing a dataset from upload to deployment
-              </p>
-            </div>
+            <iframe
+              className="w-full h-full rounded-3xl"
+              src="https://www.youtube.com/embed/EZqcT8idaY8?rel=0"
+              title="IntelliModel Demo"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+              allowFullScreen
+            />
           </div>
 
           {/* Download section */}
