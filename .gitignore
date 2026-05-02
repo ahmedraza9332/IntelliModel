@@ -1,0 +1,79 @@
+# ─── Node / Vite (Frontend) ─────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+.pnpm-store/
+
+# Vite build output (also covers Frontend/dist if run from Frontend/)
+dist/
+*.local
+
+# ─── Python (backend) ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env/
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+
+# ─── Environment & secrets ──────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── IntelliModel — runtime / generated (API & agents) ──────────────────────
+# Per-job copies of datasets, preprocessing, validation, training, improvement
+backend/runs/
+
+# Workspace session memory (paths, targets, last job state)
+backend/master_memory.json
+
+# Agent memory files written during a run
+backend/Pre Processing Agent/workflow_memory.json
+backend/Pre Processing Agent/steps to run.txt
+backend/LLM Orchestrator/orchestrator_memory.json
+
+# LLM-generated validation scripts and full-training code
+backend/LLM Orchestrator/model_testing/
+backend/LLM Orchestrator/full_training/
+backend/LLM Orchestrator/*_model_recommendations.txt
+backend/LLM Orchestrator/*model_recommendations.txt
+
+# Dataset-scoped improvement outputs (under Improvement Agent/<dataset_name>/)
+backend/Improvement Agent/**/improvement_memory.json
+backend/Improvement Agent/**/improvement_steps.txt
+backend/Improvement Agent/**/Improved_code_running/
+backend/Improvement Agent/**/improved_training/
+
+# ─── Other build / frameworks ────────────────────────────────────────────────
+build/
+.next/
+out/
+.turbo/
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Testing / coverage ───────────────────────────────────────────────────────
+coverage/
+.nyc_output/

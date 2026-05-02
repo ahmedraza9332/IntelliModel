@@ -1,0 +1,6 @@
+# Deployment API dependencies. Network access required for: pip install -r requirements.txt
+# If install fails (e.g. offline), install when online or use: pip install fastapi uvicorn joblib pydantic
+fastapi>=0.68.0
+uvicorn[standard]>=0.15.0
+joblib>=1.0.0
+pydantic>=2.0.0
