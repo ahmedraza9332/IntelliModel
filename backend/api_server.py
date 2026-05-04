@@ -55,7 +55,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -461,6 +461,79 @@ def _task_validate(job: JobState, selected_models: List[str]) -> None:
         job.logs += f"\n[ERROR] {exc}"
 
 
+def _improvement_memory_resolved_validation_code_path(
+    imp_mem: Dict[str, Any],
+) -> Tuple[Optional[str], bool]:
+    """
+    Full-training base script: prefer improved_validation_code_path, else validation_code_path.
+
+    Returns (resolved_path_or_none, used_improved_key) where used_improved_key is True iff
+    improved_validation_code_path was a non-empty string.
+    """
+    imp_raw = imp_mem.get("improved_validation_code_path")
+    val_raw = imp_mem.get("validation_code_path")
+    improved = imp_raw.strip() if isinstance(imp_raw, str) else None
+    if improved == "":
+        improved = None
+    fallback = val_raw.strip() if isinstance(val_raw, str) else None
+    if fallback == "":
+        fallback = None
+    resolved: Optional[str] = improved or fallback
+    return resolved, bool(improved)
+
+
+def _log_full_training_validation_code_path_source(used_improved: bool, resolved: Optional[str]) -> None:
+    if not resolved:
+        return
+    if used_improved:
+        print("[INFO] Using improved validation code for full training.")
+    else:
+        print(
+            "[INFO] No improved code found — using original validation code for full training "
+            "(metrics were already good enough)."
+        )
+
+
+def _patch_orchestrator_from_improvement_memory_for_train(
+    job: JobState,
+    llm_agent: Any,
+    model_name: str,
+) -> None:
+    """
+    If improvement_memory.json exists for this job, sync validation_metrics[model].code_path
+    into the orchestrator agent memory so generate_full_training_code reads the right base.
+    """
+    if not job.improvement_memory_path:
+        return
+    mem_path = Path(job.improvement_memory_path)
+    if not mem_path.is_file():
+        return
+    try:
+        with mem_path.open("r", encoding="utf-8") as fh:
+            imp_mem = json.load(fh)
+    except Exception:
+        return
+    resolved, used_improved = _improvement_memory_resolved_validation_code_path(imp_mem)
+    if not resolved or not Path(resolved).exists():
+        return
+
+    def _norm(n: str) -> str:
+        return n.lower().replace(" ", "").replace("_", "").replace("-", "")
+
+    vm = llm_agent.memory.validation_metrics or {}
+    matched = next((k for k in vm if _norm(k) == _norm(model_name)), None)
+    if not matched:
+        return
+    entry = vm[matched]
+    if not isinstance(entry, dict):
+        return
+    _log_full_training_validation_code_path_source(used_improved, resolved)
+    if entry.get("code_path") == resolved:
+        return
+    entry["code_path"] = resolved
+    llm_agent.save_memory()
+
+
 def _task_train(job: JobState, model_name: str) -> None:
     """Thread: generate + run full training code, save .pkl artifact."""
     job.status = "training"
@@ -500,6 +573,10 @@ def _task_train(job: JobState, model_name: str) -> None:
             if not llm_agent.memory.validation_metrics and _saved_vm:
                 llm_agent.memory.validation_metrics = _saved_vm
                 llm_agent.save_memory()
+
+            # Prefer improved_validation_code_path from improvement_memory.json; fall back to
+            # validation_code_path when improvement skipped (e.g. metrics already excellent).
+            _patch_orchestrator_from_improvement_memory_for_train(job, llm_agent, model_name)
 
             # Generate full training code (*_full.py) then execute it → .pkl
             llm_agent.generate_full_training_code(model_name)
@@ -1189,7 +1266,7 @@ async def confirm_improvement(job_id: str) -> Dict[str, Any]:
     validation logic.
 
     Steps:
-    1. Read improvement_memory.json → improved_validation_code_path
+    1. Read improvement_memory.json → improved_validation_code_path or validation_code_path
     2. Read orchestrator_memory.json → patch validation_metrics[model_name]["code_path"]
     3. Write orchestrator_memory.json back
     4. Update in-memory job.validation_metrics similarly
@@ -1228,19 +1305,49 @@ async def confirm_improvement(job_id: str) -> Dict[str, Any]:
             status_code=500, detail=f"Failed to read improvement_memory.json: {exc}"
         )
 
-    improved_code_path: Optional[str] = imp_mem.get("improved_validation_code_path")
+    resolved_code_path, used_improved = _improvement_memory_resolved_validation_code_path(
+        imp_mem
+    )
     model_name: Optional[str] = imp_mem.get("model_name")
+    proceed_to_deployment = bool(imp_mem.get("proceed_to_deployment"))
+    user_satisfied = bool(imp_mem.get("user_satisfied"))
+    improvement_steps_text = str(imp_mem.get("improvement_steps") or "")
+    steps_lower = improvement_steps_text.lower()
+    steps_indicate_no_code_needed = (
+        "no improvement needed" in steps_lower or "already excellent" in steps_lower
+    )
 
-    if not improved_code_path:
+    missing_path = not resolved_code_path
+    # Missing both paths is expected when metrics were already good enough and code gen was skipped.
+    skip_missing_path_error = (
+        proceed_to_deployment
+        or user_satisfied
+        or steps_indicate_no_code_needed
+    )
+
+    if missing_path and skip_missing_path_error:
+        job.status = "validation_done"
+        return {
+            "status": "confirmed",
+            "job_id": job_id,
+            "note": "No improved code path required (metrics already excellent or improvement skipped).",
+        }
+
+    if missing_path:
         raise HTTPException(
             status_code=500,
-            detail="improved_validation_code_path not found in improvement_memory.json.",
+            detail=(
+                "Neither improved_validation_code_path nor validation_code_path "
+                "found in improvement_memory.json."
+            ),
         )
     if not model_name:
         raise HTTPException(
             status_code=500,
             detail="model_name not found in improvement_memory.json.",
         )
+
+    _log_full_training_validation_code_path_source(used_improved, resolved_code_path)
 
     # Patch orchestrator_memory.json on disk
     if orchestrator_memory_path.exists():
@@ -1258,7 +1365,7 @@ async def confirm_improvement(job_id: str) -> Dict[str, Any]:
             )
             if matched:
                 if isinstance(vm[matched], dict):
-                    vm[matched]["code_path"] = improved_code_path
+                    vm[matched]["code_path"] = resolved_code_path
                 orch_mem["validation_metrics"] = vm
                 with orchestrator_memory_path.open("w", encoding="utf-8") as fh:
                     json.dump(orch_mem, fh, indent=2)
@@ -1277,7 +1384,7 @@ async def confirm_improvement(job_id: str) -> Dict[str, Any]:
             if _norm2(k) == _norm2(model_name):
                 entry = job.validation_metrics[k]
                 if isinstance(entry, dict):
-                    entry["code_path"] = improved_code_path
+                    entry["code_path"] = resolved_code_path
                 break
 
     job.status = "validation_done"

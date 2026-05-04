@@ -3,6 +3,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Optional
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -11,6 +12,63 @@ if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
 from llm_config import DEFAULT_LLM_MODEL, DEFAULT_LLM_ENDPOINT, create_chat_llm
+
+
+def _norm_model_name(name: str) -> str:
+    return name.lower().replace(" ", "").replace("_", "").replace("-", "")
+
+
+def _resolve_code_path_from_improvement_memory_files(model_name: str) -> Optional[str]:
+    """
+    Prefer improved_validation_code_path, then validation_code_path, from any
+    improvement_memory.json under Improvement Agent/ (flat or dataset subfolders).
+    Used when orchestrator_memory has no usable code_path (e.g. improvement skipped).
+    """
+    backend_dir = Path(__file__).resolve().parents[1]
+    improv_dir = backend_dir / "Improvement Agent"
+    if not improv_dir.is_dir():
+        return None
+    candidates = [improv_dir / "improvement_memory.json"]
+    try:
+        for sub in improv_dir.iterdir():
+            if sub.is_dir():
+                candidates.append(sub / "improvement_memory.json")
+    except OSError:
+        pass
+    want = _norm_model_name(model_name)
+    for memf in candidates:
+        if not memf.is_file():
+            continue
+        try:
+            with memf.open("r", encoding="utf-8") as f:
+                mem = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        mem_model = mem.get("model_name")
+        if mem_model and _norm_model_name(str(mem_model)) != want:
+            continue
+        imp_raw = mem.get("improved_validation_code_path")
+        val_raw = mem.get("validation_code_path")
+        improved = imp_raw.strip() if isinstance(imp_raw, str) else None
+        if improved == "":
+            improved = None
+        fallback = val_raw.strip() if isinstance(val_raw, str) else None
+        if fallback == "":
+            fallback = None
+        resolved = improved or fallback
+        if not resolved:
+            continue
+        if not os.path.exists(resolved):
+            continue
+        if improved:
+            print("[INFO] Using improved validation code for full training.")
+        else:
+            print(
+                "[INFO] No improved code found — using original validation code for full training "
+                "(metrics were already good enough)."
+            )
+        return resolved
+    return None
 
 
 def load_memory():
@@ -135,10 +193,14 @@ def main():
         
         model_info = validation_metrics[selected_model_name]
         code_path = model_info.get("code_path")
-        
+
         if not code_path or not os.path.exists(code_path):
-            print(f"[ERROR] Code path not found for model '{selected_model_name}': {code_path}")
-            return
+            fallback = _resolve_code_path_from_improvement_memory_files(selected_model_name)
+            if fallback:
+                code_path = fallback
+            else:
+                print(f"[ERROR] Code path not found for model '{selected_model_name}': {code_path}")
+                return
         
         print(f"[INFO] Generating full training code for: {selected_model_name}\n")
         
