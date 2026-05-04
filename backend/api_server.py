@@ -126,6 +126,8 @@ class JobState:
     improvement_memory_path: Optional[str] = None
     improvement_halted: bool = False
     improvement_halt_reason: Optional[str] = None
+    improvement_run_succeeded: Optional[bool] = None
+    improvement_run_error: Optional[str] = None
 
 
 _jobs: Dict[str, JobState] = {}
@@ -546,7 +548,10 @@ def _task_improve(job: JobState, model_name: str) -> None:
     """Thread: improvement agent — generate steps, improved code, and new metrics."""
     job.status = "improving"
     try:
-        from improvement_workflow_agent import ImprovementWorkflowAgent  # type: ignore[import]
+        from improvement_workflow_agent import (  # type: ignore[import]
+            ImprovementWorkflowAgent,
+            MetricsAlreadyGoodError,
+        )
     except Exception as exc:
         job.status = "error"
         job.error = str(exc)
@@ -580,6 +585,11 @@ def _task_improve(job: JobState, model_name: str) -> None:
             )
 
         with _JobLogCapture(job):
+            job.improvement_halted = False
+            job.improvement_halt_reason = None
+            job.improvement_run_succeeded = None
+            job.improvement_run_error = None
+
             agent = ImprovementWorkflowAgent(
                 master_memory_path=master_memory_path,
                 output_dir=IMPROVEMENT_DIR,
@@ -655,37 +665,80 @@ def _task_improve(job: JobState, model_name: str) -> None:
 
             agent.save_memory()
 
-            improvement_steps = agent.generate_improvement_steps()
-            agent.run_improved_code_generation()
-            improved_metrics = agent.run_improved_code_runner()
+            try:
+                improvement_steps = agent.generate_improvement_steps()
+            except MetricsAlreadyGoodError as exc:
+                # Baseline already excellent — skip code gen / runner; finish as success.
+                msg = str(exc)
+                job.improvement_steps = msg
+                job.original_metrics = agent.memory.validation_metrics or {}
+                job.improved_metrics = dict(job.original_metrics)
+                job.improvement_run_succeeded = False
+                job.improvement_run_error = None
+                job.improvement_halted = False
+                job.improvement_halt_reason = None
+                agent.memory.regeneration_count += 1
+                agent.save_memory()
+                job.regeneration_count = agent.memory.regeneration_count
+                if agent.memory_file_path:
+                    job.improvement_memory_path = str(agent.memory_file_path)
+                    try:
+                        mp = Path(job.improvement_memory_path)
+                        md: Dict[str, Any] = {}
+                        if mp.exists():
+                            with mp.open("r", encoding="utf-8") as fh:
+                                md = json.load(fh)
+                        md["improvement_run_succeeded"] = False
+                        md["improvement_steps"] = msg
+                        md["improved_validation_metrics"] = job.improved_metrics
+                        md.pop("improvement_run_error", None)
+                        with mp.open("w", encoding="utf-8") as fh:
+                            json.dump(md, fh, indent=2)
+                    except Exception:
+                        pass
+            else:
+                agent.run_improved_code_generation()
+                improved_metrics = agent.run_improved_code_runner()
 
-            # Increment cycle counter and persist
-            agent.memory.regeneration_count += 1
-            agent.save_memory()
+                # Increment cycle counter and persist
+                agent.memory.regeneration_count += 1
+                agent.save_memory()
 
-            job.improvement_steps = improvement_steps
-            job.improved_metrics = improved_metrics or {}
-            job.original_metrics = agent.memory.validation_metrics
-            job.regeneration_count = agent.memory.regeneration_count
-            if agent.memory_file_path:
-                job.improvement_memory_path = str(agent.memory_file_path)
+                job.improvement_steps = improvement_steps
+                job.improved_metrics = improved_metrics or {}
+                job.original_metrics = agent.memory.validation_metrics
+                job.regeneration_count = agent.memory.regeneration_count
+                if agent.memory_file_path:
+                    job.improvement_memory_path = str(agent.memory_file_path)
 
-            # Read halt flag written by improved_code_runner when improvement
-            # is infeasible — if halted, surface baseline as improved metrics.
-            mem_path_for_halt = Path(job.improvement_memory_path) if job.improvement_memory_path else None
-            if mem_path_for_halt and mem_path_for_halt.exists():
-                try:
-                    with mem_path_for_halt.open("r", encoding="utf-8") as _fh:
-                        _mem_data = json.load(_fh)
-                    if _mem_data.get("improvement_halted"):
-                        job.improvement_halted = True
-                        job.improvement_halt_reason = _mem_data.get("improvement_halt_reason")
-                        # Use the baseline metrics written by the runner so
-                        # the frontend can show identical Before/After values.
-                        baseline = _mem_data.get("improved_validation_metrics") or job.original_metrics or {}
-                        job.improved_metrics = baseline
-                except Exception:
-                    pass
+                # Runner / memory: halt flags, run outcome, parsed metrics
+                mem_path_for_halt = (
+                    Path(job.improvement_memory_path) if job.improvement_memory_path else None
+                )
+                if mem_path_for_halt and mem_path_for_halt.exists():
+                    try:
+                        with mem_path_for_halt.open("r", encoding="utf-8") as _fh:
+                            _mem_data = json.load(_fh)
+                        job.improvement_run_succeeded = _mem_data.get(
+                            "improvement_run_succeeded"
+                        )
+                        err = _mem_data.get("improvement_run_error")
+                        job.improvement_run_error = err if err else None
+                        if _mem_data.get("improvement_halted"):
+                            job.improvement_halted = True
+                            job.improvement_halt_reason = _mem_data.get(
+                                "improvement_halt_reason"
+                            )
+                            # Use the baseline metrics written by the runner so
+                            # the frontend can show identical Before/After values.
+                            baseline = (
+                                _mem_data.get("improved_validation_metrics")
+                                or job.original_metrics
+                                or {}
+                            )
+                            job.improved_metrics = baseline
+                    except Exception:
+                        pass
 
         _collect_artifacts(job)
         job.status = "improvement_done"
@@ -979,6 +1032,8 @@ def get_status(job_id: str) -> Dict[str, Any]:
         "regeneration_count": job.regeneration_count,
         "improvement_halted": job.improvement_halted,
         "improvement_halt_reason": job.improvement_halt_reason,
+        "improvement_run_succeeded": job.improvement_run_succeeded,
+        "improvement_run_error": job.improvement_run_error,
     }
 
 

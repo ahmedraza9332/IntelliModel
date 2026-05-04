@@ -50,6 +50,11 @@ FIX_PROMPT = ChatPromptTemplate.from_messages(
 # --------------------------------------------------------------------
 # Utility helpers
 # --------------------------------------------------------------------
+def sanitize_non_printable(code: str) -> str:
+    """Remove non-printable Unicode characters that cause SyntaxErrors (e.g. U+0001)."""
+    return re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]", "", code)
+
+
 def extract_code_snippet(content: str) -> str:
     """
     Extract the first fenced code block from the LLM response.
@@ -121,7 +126,7 @@ def fix_code_with_llm(code: str, error: str, plan_json: str, dataset_context: st
             "dataset_context": dataset_context,
         }
     )
-    return extract_code_snippet(fixed)
+    return sanitize_non_printable(extract_code_snippet(fixed))
 
 
 # --------------------------------------------------------------------

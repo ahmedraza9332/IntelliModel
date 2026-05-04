@@ -50,7 +50,9 @@ def _find_improvement_memory() -> Path:
     return flat
 
 
-IMPROVEMENT_MEMORY_PATH = _find_improvement_memory()
+# Resolved at runtime (not module load) so --memory CLI arg can override it.
+# Use _resolve_memory_path() inside main() instead of this constant directly.
+_DEFAULT_IMPROVEMENT_MEMORY_PATH = _find_improvement_memory()
 
 # Metric printing blocks per task type — injected verbatim into the prompt
 # so the LLM copies them exactly into the improved code.
@@ -95,6 +97,12 @@ print(f"RMSE: {rmse}")
 print(f"MAPE: {mape}")
 """,
 }
+
+
+def _sanitize_non_printable(text: str) -> str:
+    """Remove non-printable Unicode characters that cause SyntaxErrors (e.g. U+0001 SOH)."""
+    import re
+    return re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]", "", text)
 
 
 def _strip_code_fences(text: str) -> str:
@@ -168,18 +176,43 @@ def generate_improved_validation_code(
             "metric_block": metric_block,
         }
     )
-    return _strip_code_fences(raw)
+    return _sanitize_non_printable(_strip_code_fences(raw))
 
 
 def main() -> None:
+    import argparse
+
+    arg_parser = argparse.ArgumentParser(description="Generate improved validation code.")
+    arg_parser.add_argument(
+        "--memory",
+        type=str,
+        default=None,
+        help="Absolute path to improvement_memory.json (dataset-scoped). "
+             "If omitted, auto-discovery is used.",
+    )
+    args = arg_parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Resolve the correct improvement_memory.json at RUNTIME
+    # ------------------------------------------------------------------
+    if args.memory:
+        improvement_memory_path = Path(args.memory).expanduser().resolve()
+        if not improvement_memory_path.exists():
+            print(f"[ERROR] --memory path does not exist: {improvement_memory_path}")
+            sys.exit(1)
+    else:
+        improvement_memory_path = _find_improvement_memory()
+
+    print(f"[INFO] Using improvement memory: {improvement_memory_path}")
+
     # ------------------------------------------------------------------
     # Load everything from improvement_memory.json
     # ------------------------------------------------------------------
-    if not IMPROVEMENT_MEMORY_PATH.exists():
-        print(f"[ERROR] improvement_memory.json not found at: {IMPROVEMENT_MEMORY_PATH}")
+    if not improvement_memory_path.exists():
+        print(f"[ERROR] improvement_memory.json not found at: {improvement_memory_path}")
         sys.exit(1)
 
-    with IMPROVEMENT_MEMORY_PATH.open("r", encoding="utf-8") as f:
+    with improvement_memory_path.open("r", encoding="utf-8") as f:
         mem = json.load(f)
 
     model_name = mem.get("model_name")
@@ -230,7 +263,7 @@ def main() -> None:
     # Save to improved_training/{model_name}_improved_validation.py
     # Use same parent as improvement_memory.json for dataset scoping
     # ------------------------------------------------------------------
-    output_dir = IMPROVEMENT_MEMORY_PATH.parent / "improved_training"
+    output_dir = improvement_memory_path.parent / "improved_training"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = (model_name or "model").lower().replace(" ", "_").replace("-", "_")
@@ -243,10 +276,10 @@ def main() -> None:
     # Write the output path back into improvement_memory.json
     # ------------------------------------------------------------------
     try:
-        with IMPROVEMENT_MEMORY_PATH.open("r", encoding="utf-8") as f:
+        with improvement_memory_path.open("r", encoding="utf-8") as f:
             mem_data = json.load(f)
         mem_data["improved_validation_code_path"] = str(output_file.resolve())
-        with IMPROVEMENT_MEMORY_PATH.open("w", encoding="utf-8") as f:
+        with improvement_memory_path.open("w", encoding="utf-8") as f:
             json.dump(mem_data, f, indent=2)
         print(f"[INFO] improvement_memory.json updated with improved_validation_code_path.")
     except Exception as exc:

@@ -51,6 +51,16 @@ class PreprocessingCodeAgent:
         self.dataset_filename = self.dataset_path.name
 
     @staticmethod
+    def _sanitize_non_printable(code: str) -> str:
+        """
+        Remove non-printable / invisible Unicode characters that cause SyntaxErrors
+        (e.g. U+0001 SOH, U+0002 STX … U+001F, U+007F DEL, U+200B zero-width space,
+        U+FEFF BOM, etc.) while keeping legitimate whitespace (\n, \r, \t, space).
+        """
+        # Allow only printable chars + normal whitespace
+        return re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]", "", code)
+
+    @staticmethod
     def _strip_code_fences(code: str) -> str:
         """
         Remove markdown code fences from LLM output.
@@ -175,7 +185,8 @@ class PreprocessingCodeAgent:
             "dataset_filename": self.dataset_filename,
             "dataset_full_path": dataset_full_path
         })
-        return self._strip_code_fences(raw_code)
+        cleaned = self._strip_code_fences(raw_code)
+        return self._sanitize_non_printable(cleaned)
 
 
 def main():

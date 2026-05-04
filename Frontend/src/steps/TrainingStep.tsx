@@ -1,11 +1,15 @@
 import { useState, useEffect, useRef } from "react";
 import { Loader2, CheckCircle2, Zap, TrendingUp, Rocket, ArrowRight, Info } from "lucide-react";
-import { cn } from "@/lib/utils";
 import { usePoll } from "@/hooks/usePoll";
 import { getStatus, improveModel } from "@/api/client";
 import type { StatusResponse } from "@/api/client";
 import { LogTerminal, ErrorBanner } from "@/components/app";
 import type { ImprovementSnapshot } from "@/steps/ImprovementStep";
+import {
+  MetricsComparison,
+  isMetricsAlreadyExcellentBanner,
+  metricsExcellentBannerText,
+} from "@/steps/ImprovementStep";
 
 type TrainingPhase = "training" | "trained" | "improving" | "improved";
 
@@ -21,78 +25,6 @@ interface Props {
   /** Snapshot from a prior improvement step — shown read-only after training. */
   improvementSnapshot?: ImprovementSnapshot | null;
   onSuccess: (result: TrainingResult) => void;
-}
-
-const fmt = (n: number | undefined | null, d = 4) =>
-  n == null ? "—" : n.toFixed(d);
-
-function MetricDelta({ before, after }: { before: number; after: number }) {
-  const delta = after - before;
-  const pct = before !== 0 ? (delta / Math.abs(before)) * 100 : 0;
-  const better = delta > 0;
-  return (
-    <span
-      className={cn(
-        "ml-2 text-[10px] font-semibold px-1.5 py-0.5 rounded",
-        better
-          ? "bg-emerald-100 text-emerald-600"
-          : "bg-red-100 text-red-500"
-      )}
-    >
-      {better ? "+" : ""}
-      {pct.toFixed(1)}%
-    </span>
-  );
-}
-
-function MetricsComparison({
-  original,
-  improved,
-}: {
-  original: Record<string, number>;
-  improved: Record<string, number>;
-}) {
-  const keys = Object.keys(original);
-  if (keys.length === 0) return null;
-
-  return (
-    <div className="grid grid-cols-2 gap-4">
-      {/* Before */}
-      <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
-        <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-          Before improvement
-        </p>
-        {keys.map((k) => (
-          <div key={k} className="flex items-center justify-between">
-            <span className="text-xs text-slate-500 font-mono">{k}</span>
-            <span className="text-xs text-slate-700 font-mono font-semibold">
-              {fmt(original[k])}
-            </span>
-          </div>
-        ))}
-      </div>
-
-      {/* After */}
-      <div className="rounded-2xl border border-pulse-500/25 bg-pulse-500/[0.04] p-4 space-y-3">
-        <p className="text-xs font-semibold text-pulse-600 uppercase tracking-wider">
-          After improvement
-        </p>
-        {keys.map((k) => (
-          <div key={k} className="flex items-center justify-between">
-            <span className="text-xs text-slate-500 font-mono">{k}</span>
-            <div className="flex items-center">
-              <span className="text-xs text-slate-900 font-mono font-semibold">
-                {fmt(improved[k])}
-              </span>
-              {original[k] != null && improved[k] != null && (
-                <MetricDelta before={original[k]} after={improved[k]} />
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
 }
 
 export default function TrainingStep({
@@ -180,6 +112,18 @@ export default function TrainingStep({
     improveData?.original_metrics ?? improvePollData?.original_metrics;
   const improvedMetrics =
     improveData?.improved_metrics ?? improvePollData?.improved_metrics;
+  const improvementRunSucceeded =
+    improveData?.improvement_run_succeeded ?? improvePollData?.improvement_run_succeeded ?? null;
+  const improvementRunError =
+    improveData?.improvement_run_error ?? improvePollData?.improvement_run_error ?? null;
+
+  const snapshotAlreadyExcellent =
+    improvementSnapshot &&
+    isMetricsAlreadyExcellentBanner({
+      improvement_run_succeeded: improvementSnapshot.improvementRunSucceeded,
+      improvement_halt_reason: improvementSnapshot.haltReason,
+      improvement_steps: improvementSnapshot.improvementSteps,
+    });
 
   return (
     <div className="pipeline-enter w-full space-y-6">
@@ -287,13 +231,21 @@ export default function TrainingStep({
       {improvePollError && <ErrorBanner message={improvePollError} />}
 
       {/* Before / after comparison */}
-      {phase === "improved" && originalMetrics && improvedMetrics && (
+      {phase === "improved" &&
+        originalMetrics &&
+        Object.keys(originalMetrics).length > 0 && (
         <div className="pipeline-enter space-y-3">
           <div className="flex items-center gap-2 text-sm text-slate-500">
             <TrendingUp size={14} className="text-pulse-500" />
             <span>Improvement results</span>
           </div>
-          <MetricsComparison original={originalMetrics} improved={improvedMetrics} />
+          <MetricsComparison
+            original={originalMetrics}
+            improved={improvedMetrics ?? {}}
+            halted={false}
+            improvementRunSucceeded={improvementRunSucceeded}
+            improvementRunError={improvementRunError}
+          />
         </div>
       )}
 
@@ -314,7 +266,23 @@ export default function TrainingStep({
             <TrendingUp size={14} className="text-pulse-500" />
             <span>Improvement results (from improvement step)</span>
           </div>
-          {improvementSnapshot.halted && improvementSnapshot.haltReason && (
+          {snapshotAlreadyExcellent && (
+            <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 flex items-start gap-3 shadow-sm">
+              <CheckCircle2
+                size={20}
+                className="text-emerald-600 flex-shrink-0 mt-0.5"
+              />
+              <p className="text-sm text-emerald-900 leading-relaxed">
+                {metricsExcellentBannerText(
+                  improvementSnapshot.improvementSteps,
+                  improvementSnapshot.haltReason
+                )}
+              </p>
+            </div>
+          )}
+          {!snapshotAlreadyExcellent &&
+            improvementSnapshot.halted &&
+            improvementSnapshot.haltReason && (
             <div className="rounded-2xl border border-blue-200 bg-blue-50 p-4 flex items-start gap-3">
               <Info size={16} className="text-blue-500 flex-shrink-0 mt-0.5" />
               <div>
@@ -327,10 +295,17 @@ export default function TrainingStep({
               </div>
             </div>
           )}
-          {improvementSnapshot.original && improvementSnapshot.improved && (
+          {improvementSnapshot.original &&
+            Object.keys(improvementSnapshot.original).length > 0 &&
+            !snapshotAlreadyExcellent && (
             <MetricsComparison
               original={improvementSnapshot.original}
-              improved={improvementSnapshot.improved}
+              improved={improvementSnapshot.improved ?? {}}
+              halted={improvementSnapshot.halted}
+              improvementRunSucceeded={
+                improvementSnapshot.improvementRunSucceeded ?? null
+              }
+              improvementRunError={improvementSnapshot.improvementRunError ?? null}
             />
           )}
         </div>

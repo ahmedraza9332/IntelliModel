@@ -10,7 +10,6 @@ import {
   RefreshCw,
   ChevronDown,
   ChevronUp,
-  AlertTriangle,
   Rocket,
   Info,
 } from "lucide-react";
@@ -25,13 +24,39 @@ import {
 import type { StatusResponse } from "@/api/client";
 import { LogTerminal, ErrorBanner } from "@/components/app";
 
-const MAX_CYCLES = 5;
-
 export interface ImprovementSnapshot {
   original: Record<string, number> | null;
   improved: Record<string, number> | null;
   halted: boolean;
   haltReason: string | null;
+  improvementRunSucceeded?: boolean | null;
+  improvementRunError?: string | null;
+  improvementSteps?: string | null;
+}
+
+/** Backend says run did not "succeed" and copy indicates metrics were already strong enough. */
+export function isMetricsAlreadyExcellentBanner(params: {
+  improvement_run_succeeded?: boolean | null;
+  improvement_halt_reason?: string | null;
+  improvement_steps?: string | null;
+}): boolean {
+  if (params.improvement_run_succeeded !== false) return false;
+  const t = `${params.improvement_halt_reason ?? ""} ${params.improvement_steps ?? ""}`.toLowerCase();
+  return (
+    t.includes("already excellent") ||
+    t.includes("no improvement needed")
+  );
+}
+
+export function metricsExcellentBannerText(
+  improvement_steps: string | null | undefined,
+  improvement_halt_reason: string | null | undefined
+): string {
+  const s = (improvement_steps?.trim() || improvement_halt_reason?.trim() || "").trim();
+  return (
+    s ||
+    "Metrics are already strong enough that no further improvement run was required."
+  );
 }
 
 type Phase =
@@ -74,73 +99,116 @@ function MetricDelta({ before, after }: { before: number; after: number }) {
   );
 }
 
-function MetricsComparison({
+function isImprovedMetricsEmpty(
+  improved: Record<string, number> | null | undefined,
+  keys: string[]
+): boolean {
+  if (!improved || Object.keys(improved).length === 0) return true;
+  return keys.every(
+    (k) =>
+      improved[k] == null ||
+      (typeof improved[k] === "number" && Number.isNaN(improved[k] as number))
+  );
+}
+
+export function MetricsComparison({
   original,
   improved,
   halted = false,
+  improvementRunSucceeded = null,
+  improvementRunError = null,
 }: {
   original: Record<string, number>;
-  improved: Record<string, number>;
+  improved: Record<string, number> | null | undefined;
   halted?: boolean;
+  improvementRunSucceeded?: boolean | null;
+  improvementRunError?: string | null;
 }) {
   const keys = Object.keys(original);
   if (keys.length === 0) return null;
 
-  return (
-    <div className="grid grid-cols-2 gap-4">
-      <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
-        <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-          Before improvement
-        </p>
-        {keys.map((k) => (
-          <div key={k} className="flex items-center justify-between">
-            <span className="text-xs text-slate-500 font-mono">{k}</span>
-            <span className="text-xs text-slate-700 font-mono font-semibold">
-              {fmt(original[k])}
-            </span>
-          </div>
-        ))}
-      </div>
+  const imp = improved ?? {};
+  const useBaselineAfter = !halted && isImprovedMetricsEmpty(imp, keys);
 
-      <div
-        className={cn(
-          "rounded-2xl border p-4 space-y-3",
-          halted
-            ? "border-slate-200 bg-slate-50"
-            : "border-pulse-500/25 bg-pulse-500/[0.04]"
-        )}
-      >
-        <p
-          className={cn(
-            "text-xs font-semibold uppercase tracking-wider",
-            halted ? "text-slate-400" : "text-pulse-600"
-          )}
-        >
-          After improvement
-        </p>
-        {keys.map((k) => {
-          // When halted, show the same value as Before (no delta badge)
-          const afterVal = halted ? original[k] : improved[k];
-          return (
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 gap-4">
+        <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+          <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+            Before improvement
+          </p>
+          {keys.map((k) => (
             <div key={k} className="flex items-center justify-between">
               <span className="text-xs text-slate-500 font-mono">{k}</span>
-              <div className="flex items-center">
-                <span
-                  className={cn(
-                    "text-xs font-mono font-semibold",
-                    halted ? "text-slate-500" : "text-slate-900"
-                  )}
-                >
-                  {fmt(afterVal)}
-                </span>
-                {!halted && original[k] != null && improved[k] != null && (
-                  <MetricDelta before={original[k]} after={improved[k]} />
-                )}
-              </div>
+              <span className="text-xs text-slate-700 font-mono font-semibold">
+                {fmt(original[k])}
+              </span>
             </div>
-          );
-        })}
+          ))}
+        </div>
+
+        <div
+          className={cn(
+            "rounded-2xl border p-4 space-y-3",
+            halted || useBaselineAfter
+              ? "border-slate-200 bg-slate-50"
+              : "border-pulse-500/25 bg-pulse-500/[0.04]"
+          )}
+        >
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+            <p
+              className={cn(
+                "text-xs font-semibold uppercase tracking-wider",
+                halted || useBaselineAfter ? "text-slate-400" : "text-pulse-600"
+              )}
+            >
+              After improvement
+            </p>
+            {useBaselineAfter && (
+              <span className="text-[10px] font-medium text-slate-400 normal-case tracking-normal">
+                (no change)
+              </span>
+            )}
+          </div>
+          {keys.map((k) => {
+            const rawAfter = halted ? original[k] : imp[k];
+            const afterVal =
+              halted || rawAfter == null || Number.isNaN(Number(rawAfter))
+                ? original[k]
+                : rawAfter;
+            const showDelta =
+              !halted &&
+              !useBaselineAfter &&
+              original[k] != null &&
+              imp[k] != null &&
+              !Number.isNaN(Number(imp[k]));
+
+            return (
+              <div key={k} className="flex items-center justify-between">
+                <span className="text-xs text-slate-500 font-mono">{k}</span>
+                <div className="flex items-center">
+                  <span
+                    className={cn(
+                      "text-xs font-mono font-semibold",
+                      halted || useBaselineAfter ? "text-slate-500" : "text-slate-900"
+                    )}
+                  >
+                    {fmt(afterVal)}
+                  </span>
+                  {showDelta && (
+                    <MetricDelta before={original[k]} after={imp[k] as number} />
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
       </div>
+      {improvementRunSucceeded === false && improvementRunError ? (
+        <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+          {improvementRunError}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -178,21 +246,17 @@ function ChangesApplied({ steps }: { steps: string }) {
   );
 }
 
-function CyclesBadge({ count }: { count: number }) {
-  const exhausted = count >= MAX_CYCLES;
+function RunsBadge({ count }: { count: number }) {
+  const label =
+    count === 0
+      ? "First improvement run"
+      : count === 1
+        ? "1 improvement run completed"
+        : `${count} improvement runs completed`;
   return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border",
-        exhausted
-          ? "bg-red-50 text-red-600 border-red-200"
-          : count >= MAX_CYCLES - 1
-          ? "bg-amber-50 text-amber-600 border-amber-200"
-          : "bg-slate-100 text-slate-600 border-slate-200"
-      )}
-    >
+    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border bg-slate-100 text-slate-600 border-slate-200">
       <RefreshCw size={11} />
-      {count}/{MAX_CYCLES} cycles used
+      {label}
     </span>
   );
 }
@@ -217,7 +281,18 @@ export default function ImprovementStep({
     cycleCount: number;
     halted: boolean;
     haltReason: string | null;
-  }>({ original: null, improved: null, steps: null, cycleCount: 0, halted: false, haltReason: null });
+    improvementRunSucceeded: boolean | null;
+    improvementRunError: string | null;
+  }>({
+    original: null,
+    improved: null,
+    steps: null,
+    cycleCount: 0,
+    halted: false,
+    haltReason: null,
+    improvementRunSucceeded: null,
+    improvementRunError: null,
+  });
 
   const { data, error: pollError } = usePoll<StatusResponse>({
     fetchFn: () => getStatus(jobId),
@@ -233,6 +308,8 @@ export default function ImprovementStep({
           cycleCount: d.regeneration_count ?? 0,
           halted: d.improvement_halted ?? false,
           haltReason: d.improvement_halt_reason ?? null,
+          improvementRunSucceeded: d.improvement_run_succeeded ?? null,
+          improvementRunError: d.improvement_run_error ?? null,
         });
         setPhase("done");
       }
@@ -241,7 +318,6 @@ export default function ImprovementStep({
 
   const logs = data?.logs ?? "";
   const isError = data?.status === "error";
-  const cyclesExhausted = displayData.cycleCount >= MAX_CYCLES;
 
   // ── Action: satisfied → confirm + train ────────────────────────────────────
   const handleSatisfied = async () => {
@@ -254,6 +330,9 @@ export default function ImprovementStep({
         improved: displayData.improved,
         halted: displayData.halted,
         haltReason: displayData.haltReason,
+        improvementRunSucceeded: displayData.improvementRunSucceeded,
+        improvementRunError: displayData.improvementRunError,
+        improvementSteps: displayData.steps,
       });
     } catch (err) {
       setActionError(
@@ -378,76 +457,88 @@ export default function ImprovementStep({
       {/* Results section (visible when done or discarding) */}
       {(phase === "done" || phase === "discarding") && (
         <>
-          {/* Cycles counter */}
-          <div className="flex items-center gap-3">
-            <CyclesBadge count={displayData.cycleCount} />
-            {displayData.original && displayData.improved && (
-              <span className="text-xs text-slate-400 flex items-center gap-1">
-                <TrendingUp size={11} />
-                Metrics for {modelName}
-              </span>
-            )}
-          </div>
+          {(() => {
+            const showExcellentOnly = isMetricsAlreadyExcellentBanner({
+              improvement_run_succeeded: displayData.improvementRunSucceeded,
+              improvement_halt_reason: displayData.haltReason,
+              improvement_steps: displayData.steps,
+            });
+            const hasOriginalMetrics =
+              displayData.original && Object.keys(displayData.original).length > 0;
 
-          {/* Halt info banner */}
-          {displayData.halted && displayData.haltReason && (
-            <div className="rounded-2xl border border-blue-200 bg-blue-50 p-4 flex items-start gap-3">
-              <Info size={16} className="text-blue-500 flex-shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-semibold text-blue-800">
-                  Improvement was not attempted
-                </p>
-                <p className="text-xs text-blue-700 mt-1 leading-relaxed">
-                  {displayData.haltReason}
-                </p>
-              </div>
-            </div>
-          )}
+            return (
+              <>
+                {/* Cycles counter */}
+                <div className="flex items-center gap-3">
+                  <RunsBadge count={displayData.cycleCount} />
+                  {hasOriginalMetrics && (
+                    <span className="text-xs text-slate-400 flex items-center gap-1">
+                      <TrendingUp size={11} />
+                      Metrics for {modelName}
+                    </span>
+                  )}
+                </div>
 
-          {/* Before/after metrics */}
-          {displayData.original && displayData.improved ? (
-            <MetricsComparison
-              original={displayData.original}
-              improved={displayData.improved}
-              halted={displayData.halted}
-            />
-          ) : (
-            <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 flex items-center gap-3">
-              <CheckCircle2 size={16} className="text-emerald-500 flex-shrink-0" />
-              <span className="text-sm text-slate-700">
-                Improvement complete for {modelName}.
-              </span>
-            </div>
-          )}
+                {/* Metrics already excellent — single success message, no steps/code UI */}
+                {showExcellentOnly && (
+                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 flex items-start gap-3 shadow-sm">
+                    <CheckCircle2
+                      size={20}
+                      className="text-emerald-600 flex-shrink-0 mt-0.5"
+                    />
+                    <p className="text-sm text-emerald-900 leading-relaxed">
+                      {metricsExcellentBannerText(
+                        displayData.steps,
+                        displayData.haltReason
+                      )}
+                    </p>
+                  </div>
+                )}
 
-          {/* Changes applied (collapsible) */}
-          {displayData.steps && (
-            <ChangesApplied steps={displayData.steps} />
-          )}
+                {/* Halt info banner (dataset infeasible, etc.) — not the "already excellent" path */}
+                {!showExcellentOnly && displayData.halted && displayData.haltReason && (
+                  <div className="rounded-2xl border border-blue-200 bg-blue-50 p-4 flex items-start gap-3">
+                    <Info size={16} className="text-blue-500 flex-shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-sm font-semibold text-blue-800">
+                        Improvement was not attempted
+                      </p>
+                      <p className="text-xs text-blue-700 mt-1 leading-relaxed">
+                        {displayData.haltReason}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Before/after metrics (hidden when "already excellent" — banner carries the summary) */}
+                {hasOriginalMetrics && !showExcellentOnly ? (
+                  <MetricsComparison
+                    original={displayData.original!}
+                    improved={displayData.improved ?? {}}
+                    halted={displayData.halted}
+                    improvementRunSucceeded={displayData.improvementRunSucceeded}
+                    improvementRunError={displayData.improvementRunError}
+                  />
+                ) : !hasOriginalMetrics ? (
+                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 flex items-center gap-3">
+                    <CheckCircle2 size={16} className="text-emerald-500 flex-shrink-0" />
+                    <span className="text-sm text-slate-700">
+                      Improvement complete for {modelName}.
+                    </span>
+                  </div>
+                ) : null}
+
+                {/* Changes applied (collapsible) — hidden when metrics were already excellent */}
+                {displayData.steps && !showExcellentOnly && (
+                  <ChangesApplied steps={displayData.steps} />
+                )}
+              </>
+            );
+          })()}
         </>
       )}
 
-      {/* Dataset limitations warning when cycles exhausted */}
-      {phase === "done" && cyclesExhausted && (
-        <div className="pipeline-enter rounded-2xl border border-amber-200 bg-amber-50 p-5 space-y-3">
-          <div className="flex items-start gap-3">
-            <AlertTriangle size={16} className="text-amber-500 flex-shrink-0 mt-0.5" />
-            <div>
-              <p className="text-sm font-semibold text-amber-800">
-                Maximum improvement cycles reached ({MAX_CYCLES}/{MAX_CYCLES})
-              </p>
-              <p className="text-xs text-amber-700 mt-1 leading-relaxed">
-                The model could not be improved further. Possible reasons: dataset
-                is too small, features lack predictive signal, or the model type is
-                near its theoretical ceiling for this data. Consider collecting more
-                data, engineering better features, or choosing a different model.
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Decision buttons — shown when done and cycles not exhausted or when deploying */}
+      {/* Decision buttons — shown when done */}
       {phase === "done" && (
         <div className="pipeline-enter rounded-2xl border border-slate-200 bg-white p-6 space-y-3">
           <p className="text-sm font-semibold text-slate-800">
@@ -470,31 +561,11 @@ export default function ImprovementStep({
             <button
               type="button"
               onClick={handleTryAgain}
-              disabled={cyclesExhausted}
-              title={
-                cyclesExhausted
-                  ? `Maximum ${MAX_CYCLES} cycles reached`
-                  : `${MAX_CYCLES - displayData.cycleCount} cycle(s) remaining`
-              }
-              className={cn(
-                "flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-xl border-2 text-sm font-semibold transition-all",
-                cyclesExhausted
-                  ? "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed opacity-60"
-                  : "border-purple-200 bg-purple-50 text-purple-700 hover:bg-purple-100 hover:border-purple-300"
-              )}
+              title="Run the improvement agent again on this model"
+              className="flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-xl border-2 border-purple-200 bg-purple-50 text-purple-700 hover:bg-purple-100 hover:border-purple-300 text-sm font-semibold transition-all"
             >
               <RefreshCw size={16} />
               Try another improvement
-              <span
-                className={cn(
-                  "text-[10px] font-normal px-1.5 py-0.5 rounded-full",
-                  cyclesExhausted
-                    ? "bg-slate-200 text-slate-500"
-                    : "bg-purple-200/60 text-purple-600"
-                )}
-              >
-                {displayData.cycleCount}/{MAX_CYCLES}
-              </span>
             </button>
           </div>
 

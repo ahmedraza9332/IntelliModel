@@ -104,12 +104,16 @@ export interface StatusResponse {
   improvement_steps: string | null;
   improved_metrics: Record<string, number> | null;
   original_metrics: Record<string, number> | null;
-  /** Number of improvement cycles run so far (0 before any improvement) */
+  /** Number of improvement runs completed for this job (informational; no cap) */
   regeneration_count: number;
   /** True when the improvement agent halted early (e.g. dataset too small) */
   improvement_halted?: boolean;
   /** Human-readable reason for the halt, present when improvement_halted is true */
   improvement_halt_reason?: string | null;
+  /** False when the runner did not record a successful improvement (e.g. already excellent) */
+  improvement_run_succeeded?: boolean | null;
+  /** Warning / diagnostics when improvement_run_succeeded is false */
+  improvement_run_error?: string | null;
 }
 
 export interface FeatureStat {

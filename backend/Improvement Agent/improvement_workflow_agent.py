@@ -12,7 +12,7 @@ Orchestrates the improvement workflow:
   5. decision_loop      — Show before/after to user:
        a. Satisfied → proceed to full training (deployment path).
        b. Not satisfied → re-run improvement OR select a different model
-          (up to MAX_REGENERATIONS=5 cycles total).
+          (no fixed cycle limit).
   6. persist_memory     — Write final state to improvement_memory.json and
                           master_memory.json.
 
@@ -44,8 +44,13 @@ from improvement_steps_generator import (  # type: ignore[import]
     DEFAULT_ENDPOINT,
 )
 
-# Maximum number of improvement regeneration cycles before giving up
-MAX_REGENERATIONS = 5
+
+class MetricsAlreadyGoodError(Exception):
+    """Raised when baseline metrics are already above the excellence threshold.
+
+    This is a sentinel — caught by the graph node to route directly to
+    persist_memory without generating improvement steps or code.
+    """
 
 
 @dataclass
@@ -245,6 +250,44 @@ class ImprovementWorkflowAgent:
         return master_memory
 
     # ======================================================================
+    # METRICS QUALITY CHECK (before generating steps)
+    # ======================================================================
+
+    # Thresholds above which improvement is unnecessary
+    _GOOD_ENOUGH_THRESHOLDS = {
+        "R2":       ("higher", 0.97),
+        "Accuracy": ("higher", 0.97),
+        "F1":       ("higher", 0.97),
+        "ROC_AUC":  ("higher", 0.97),
+        "MAE":      ("lower",  None),   # no absolute threshold for error metrics
+        "RMSE":     ("lower",  None),
+        "MAPE":     ("lower",  None),
+    }
+
+    def _metrics_are_good_enough(self) -> tuple[bool, str]:
+        """
+        Return (True, reason_message) if the baseline metrics are already
+        good enough that improvement is unnecessary (≥ 0.97 for quality metrics).
+        """
+        metrics = self.memory.validation_metrics or {}
+        for key, (direction, threshold) in self._GOOD_ENOUGH_THRESHOLDS.items():
+            if threshold is None:
+                continue
+            val = metrics.get(key)
+            if val is None:
+                continue
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                continue
+            if direction == "higher" and val >= threshold:
+                return True, (
+                    f"✅ Metrics are already excellent — {key} = {val:.4f} "
+                    f"(threshold ≥ {threshold}). No improvement needed."
+                )
+        return False, ""
+
+    # ======================================================================
     # STEP 2: GENERATE IMPROVEMENT STEPS
     # ======================================================================
 
@@ -253,6 +296,20 @@ class ImprovementWorkflowAgent:
         print("\n" + "=" * 60)
         print("IMPROVEMENT WORKFLOW - STEP 2: Generating Improvement Steps")
         print("=" * 60)
+
+        # ── Early-exit: metrics already excellent ──────────────────────────
+        good_enough, reason = self._metrics_are_good_enough()
+        if good_enough:
+            print(f"\n{reason}")
+            # Write an informational steps file so downstream paths don't break
+            self.memory.improvement_steps = reason
+            self.memory.improvement_steps_path.parent.mkdir(parents=True, exist_ok=True)
+            self.memory.improvement_steps_path.write_text(reason, encoding="utf-8")
+            self.memory.user_satisfied = True
+            self.memory.proceed_to_deployment = True
+            self.save_memory()
+            # Use a special status string recognised by the graph router
+            raise MetricsAlreadyGoodError(reason)
 
         validation_code = read_file(str(self.memory.validation_code_path))
         dataset_report = read_file(str(self.memory.dataset_report_path))
@@ -298,9 +355,16 @@ class ImprovementWorkflowAgent:
             print(f"[WARN] improved_code_gen.py not found: {improved_script}. Skipping.")
             return None
 
+        cmd_gen = [sys.executable, str(improved_script)]
+        if self.memory_file_path and self.memory_file_path.exists():
+            cmd_gen.extend(["--memory", str(self.memory_file_path.resolve())])
+            print(f"[INFO] Passing memory path to code gen: {self.memory_file_path}")
+        else:
+            print("[WARN] No memory_file_path available — improved_code_gen will use auto-discovery.")
+
         try:
             subprocess.run(
-                [sys.executable, str(improved_script)],
+                cmd_gen,
                 cwd=str(project_root),
                 check=True,
             )
@@ -360,8 +424,12 @@ class ImprovementWorkflowAgent:
             print(f"[WARN] improved_code_runner.py not found: {runner_script}. Skipping.")
             return None
 
+        cmd: list[str] = [sys.executable, str(runner_script)]
+        if self.memory_file_path and self.memory_file_path.exists():
+            cmd.extend(["--memory", str(self.memory_file_path.resolve())])
+
         result = subprocess.run(
-            [sys.executable, str(runner_script)],
+            cmd,
             cwd=str(project_root),
             capture_output=False,
             text=True,
@@ -400,7 +468,6 @@ class ImprovementWorkflowAgent:
           'deploy'          — user is satisfied, proceed to full training
           'regenerate'      — user wants another improvement cycle
           'select_model'    — user wants to pick a different model
-          'limit_reached'   — regeneration limit exceeded
         """
         baseline = self.memory.validation_metrics
         improved = self.memory.improved_validation_metrics
@@ -418,18 +485,7 @@ class ImprovementWorkflowAgent:
         else:
             print("⚠️  No improved metrics were captured.")
 
-        # Check regeneration limit
-        if self.memory.regeneration_count >= MAX_REGENERATIONS:
-            print(
-                f"\n⛔  Maximum improvement cycles reached ({MAX_REGENERATIONS}). "
-                "The model could not be improved further on this dataset.\n"
-            )
-            self._explain_dataset_limitations()
-            return "limit_reached"
-
-        remaining = MAX_REGENERATIONS - self.memory.regeneration_count
-        print(f"\n  Improvement cycles used: {self.memory.regeneration_count}/{MAX_REGENERATIONS}")
-        print(f"  Remaining cycles: {remaining}\n")
+        print(f"\n  Improvement runs so far: {self.memory.regeneration_count}\n")
 
         print("What would you like to do?")
         print("  a. Proceed to full training / deployment (satisfied)")
@@ -457,24 +513,6 @@ class ImprovementWorkflowAgent:
                 self.memory.user_satisfied = True
                 self.memory.proceed_to_deployment = True
                 return "deploy"
-
-    def _explain_dataset_limitations(self) -> None:
-        """Print a helpful explanation when the improvement limit is reached."""
-        print(
-            "Possible reasons this model could not be improved further:\n"
-            "  1. Dataset size: Too few rows limit what any algorithm can learn.\n"
-            "  2. Feature signal: The available features may not contain enough\n"
-            "     predictive information for the target variable.\n"
-            "  3. Model ceiling: The chosen model type may already be near its\n"
-            "     theoretical maximum for this dataset.\n"
-            "  4. Data quality: Missing values, noise, or outliers cap achievable\n"
-            "     performance regardless of tuning.\n\n"
-            "Recommendations:\n"
-            "  • Collect more training data.\n"
-            "  • Engineer better features based on domain knowledge.\n"
-            "  • Consider a different modelling approach (deep learning, ensembles).\n"
-            "  • Review data quality and preprocessing pipeline.\n"
-        )
 
     # ======================================================================
     # WORKFLOW GRAPH
@@ -509,8 +547,12 @@ class ImprovementWorkflowAgent:
         )
         state_graph.add_conditional_edges(
             "generate_improvements",
-            self._status_router,
-            {"error": END, "ok": "generate_improved_code"},
+            # If metrics were already good (skip_improvement=True), jump straight to deploy
+            lambda s: "persist_memory" if s.get("skip_improvement") else (
+                "error" if s.get("status") == "error" else "generate_improved_code"
+            ),
+            {"error": END, "generate_improved_code": "generate_improved_code",
+             "persist_memory": "persist_memory"},
         )
         state_graph.add_conditional_edges(
             "generate_improved_code",
@@ -529,7 +571,6 @@ class ImprovementWorkflowAgent:
                 "deploy": "persist_memory",
                 "regenerate": "generate_improvements",
                 "select_model": "load_memory",
-                "limit_reached": "persist_memory",
                 "error": END,
             },
         )
@@ -567,6 +608,12 @@ class ImprovementWorkflowAgent:
             steps = self.generate_improvement_steps()
             self._add_memory_entry("Generate improvement steps", f"{len(steps)} chars")
             return {"improvement_steps": steps, "status": "ok", "error": ""}
+        except MetricsAlreadyGoodError as exc:
+            # Metrics are already excellent — skip improvement, go straight to deploy
+            msg = str(exc)
+            self._add_memory_entry("Generate improvement steps", msg)
+            return {"improvement_steps": msg, "status": "ok", "decision": "deploy",
+                    "skip_improvement": True, "error": ""}
         except Exception as exc:
             msg = f"Improvement step generation failed: {exc}"
             self._add_memory_entry("Generate improvement steps", msg)
@@ -755,7 +802,7 @@ def main() -> None:
             print(f"  Model: {mem.get('model_name')}")
             print(f"  Dataset folder: {mem.get('dataset_folder')}")
             print(f"  Proceed to deployment: {mem.get('proceed_to_deployment')}")
-            print(f"  Regeneration cycles used: {mem.get('regeneration_count')}/{MAX_REGENERATIONS}")
+            print(f"  Improvement runs recorded: {mem.get('regeneration_count', 0)}")
             sys.exit(0)
 
         error = result_state.get("error", "Unknown error")

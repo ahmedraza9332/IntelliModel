@@ -25,6 +25,7 @@ import sys
 import subprocess
 import traceback
 from pathlib import Path
+from typing import Optional
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -60,8 +61,20 @@ def _find_improvement_memory() -> Path:
     return flat
 
 
-IMPROVEMENT_MEMORY_PATH = _find_improvement_memory()
+def resolve_improvement_memory_path(explicit: Optional[Path]) -> Path:
+    """Prefer CLI --memory path; otherwise first improvement_memory.json under agent dir."""
+    if explicit is not None:
+        p = explicit.expanduser().resolve()
+        if p.exists():
+            return p
+        print(f"[WARN] --memory path does not exist: {p}, falling back to auto-discovery.")
+    return _find_improvement_memory()
+
+
 MAX_ITERATIONS = 3
+
+# Canonical metric names → regex alternation for stdout (beyond _METRIC_PATTERNS)
+_R2_ALIASES = r"(?:R2|R\^2|R²|r2)"
 
 
 # ============================================================
@@ -74,13 +87,13 @@ _METRIC_PATTERNS = {
     "MAE":       rf"(?<!\w)MAE\s*[:\s=]+{_NUM}",
     "MSE":       rf"(?<!\w)MSE\s*[:\s=]+{_NUM}",
     "RMSE":      rf"(?<!\w)RMSE\s*[:\s=]+{_NUM}",
-    "R2":        rf"R2\s*[:\s=]+{_NUM}",
-    "Accuracy":  rf"Accuracy\s*[:\s=]+{_NUM}",
-    "Precision": rf"Precision\s*[:\s=]+{_NUM}",
-    "Recall":    rf"Recall\s*[:\s=]+{_NUM}",
+    "R2":        rf"(?<!\w){_R2_ALIASES}\s*[:\s=]+{_NUM}",
+    "Accuracy":  rf"(?<!\w)Accuracy\s*[:\s=]+{_NUM}",
+    "Precision": rf"(?<!\w)Precision\s*[:\s=]+{_NUM}",
+    "Recall":    rf"(?<!\w)Recall\s*[:\s=]+{_NUM}",
     "F1":        rf"(?<!\w)F1\s*[:\s=]+{_NUM}",
-    "ROC_AUC":   rf"ROC_AUC\s*[:\s=]+{_NUM}",
-    "MAPE":      rf"MAPE\s*[:\s=]+{_NUM}",
+    "ROC_AUC":   rf"(?<!\w)ROC[_\s-]?AUC\s*[:\s=]+{_NUM}",
+    "MAPE":      rf"(?<!\w)MAPE\s*[:\s=]+{_NUM}",
 }
 
 _TASK_METRIC_KEYS = {
@@ -106,6 +119,109 @@ def parse_metrics_from_stdout(stdout: str, task_type: str = "regression") -> dic
             except ValueError:
                 pass
     return metrics
+
+
+_INTELLIMODEL_JSON_TAG = "INTELLIMODEL_METRICS_JSON"
+
+# Lowercased / common aliases → canonical keys used by orchestrator + frontend
+_METRIC_KEY_ALIASES: dict[str, str] = {
+    "mae": "MAE",
+    "mse": "MSE",
+    "rmse": "RMSE",
+    "r2": "R2",
+    "r²": "R2",
+    "r^2": "R2",
+    "accuracy": "Accuracy",
+    "precision": "Precision",
+    "recall": "Recall",
+    "f1": "F1",
+    "f1_score": "F1",
+    "roc_auc": "ROC_AUC",
+    "rocauc": "ROC_AUC",
+    "auc": "ROC_AUC",
+    "mape": "MAPE",
+}
+
+
+def _slug_metric_key(key: str) -> str:
+    return re.sub(r"[\s\-]+", "_", key.strip().lower())
+
+
+def normalize_metrics_keys(
+    metrics: dict,
+    baseline: dict | None = None,
+) -> dict[str, float]:
+    """Map aliases / odd casing to canonical names so UI keys align with baseline."""
+    out: dict[str, float] = {}
+    baseline = baseline or {}
+
+    for raw_k, raw_v in metrics.items():
+        if raw_v is None:
+            continue
+        k = str(raw_k).strip()
+        slug = _slug_metric_key(k)
+        canon = _METRIC_KEY_ALIASES.get(slug)
+        if canon is None:
+            for bk in baseline:
+                if _slug_metric_key(bk) == slug or bk.lower() == k.lower():
+                    canon = bk
+                    break
+            if canon is None and k in _METRIC_PATTERNS:
+                canon = k
+            elif canon is None:
+                for std in _METRIC_PATTERNS:
+                    if std.lower() == k.lower():
+                        canon = std
+                        break
+        if canon is None:
+            continue
+        try:
+            out[canon] = float(raw_v)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def parse_metrics_json_line(stdout: str) -> dict:
+    """
+    Fallback: one line containing INTELLIMODEL_METRICS_JSON followed by a JSON object.
+    Example: INTELLIMODEL_METRICS_JSON {"MAE": 1.2, "R2": 0.45}
+    """
+    for line in reversed(stdout.splitlines()):
+        s = line.strip()
+        if _INTELLIMODEL_JSON_TAG not in s:
+            continue
+        idx = s.find(_INTELLIMODEL_JSON_TAG)
+        payload = s[idx + len(_INTELLIMODEL_JSON_TAG) :].strip().lstrip("=: \t")
+        if not payload:
+            continue
+        try:
+            d = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        parsed: dict[str, float] = {}
+        for kk, vv in d.items():
+            try:
+                parsed[str(kk)] = float(vv)
+            except (TypeError, ValueError):
+                pass
+        if parsed:
+            return parsed
+    return {}
+
+
+def collect_parsed_metrics(
+    stdout: str,
+    task_type: str,
+    baseline: dict,
+) -> dict[str, float]:
+    """Regex stdout parse, then JSON-line fallback; keys aligned to baseline naming."""
+    merged = dict(parse_metrics_from_stdout(stdout, task_type))
+    for k, v in parse_metrics_json_line(stdout).items():
+        merged.setdefault(k, v)
+    return normalize_metrics_keys(merged, baseline)
 
 
 # ============================================================
@@ -206,6 +322,9 @@ def generate_fixed_code(
                 "code without changing the model logic or evaluation semantics. "
                 "You MUST ensure the fixed code prints metrics in this exact format at the end:\n"
                 f"{metric_print_reminder}\n"
+                "Additionally, print exactly one line: "
+                f'print("INTELLIMODEL_METRICS_JSON " + json.dumps({{...metric names as strings...}})) '
+                "using the same numeric values (so metrics can be parsed even if f-strings differ).\n"
                 "Return ONLY valid Python code. No explanations.",
             ),
             (
@@ -257,14 +376,17 @@ def run_code_subprocess(code_path: Path, cwd: Path, timeout: int = 300):
 # MAIN
 # ============================================================
 
-def main():
+def main(memory_path: Optional[Path] = None) -> None:
     print("=== Improved Code Runner ===")
 
-    if not IMPROVEMENT_MEMORY_PATH.exists():
-        print(f"[ERROR] improvement_memory.json not found at: {IMPROVEMENT_MEMORY_PATH}")
+    mem_path = resolve_improvement_memory_path(memory_path)
+    print(f"[INFO] Using improvement memory: {mem_path}")
+
+    if not mem_path.exists():
+        print(f"[ERROR] improvement_memory.json not found at: {mem_path}")
         return
 
-    with IMPROVEMENT_MEMORY_PATH.open("r", encoding="utf-8") as f:
+    with mem_path.open("r", encoding="utf-8") as f:
         improv_mem = json.load(f)
 
     dataset_context = improv_mem.get("dataset_context", "")
@@ -273,9 +395,12 @@ def main():
         improv_mem.get("improved_validation_code_path")
         or improv_mem.get("validation_code_path")
     )
-    baseline_metrics = improv_mem.get("validation_metrics") or {}
+    baseline_metrics = normalize_metrics_keys(
+        improv_mem.get("validation_metrics") or {},
+        {},
+    )
     dataset_report_path_str = improv_mem.get("dataset_report_path")
-    task_type = improv_mem.get("task_type", "regression")
+    task_type = improv_mem.get("task_type") or "regression"
     model_name = improv_mem.get("model_name", "model")
 
     # Validate required fields
@@ -322,7 +447,7 @@ def main():
                 # Write baseline metrics so frontend shows numbers not dashes
                 _halt_reason = " | ".join(feasibility.get("reasons", ["Dataset limitations prevent improvement."]))
                 try:
-                    _mem_path = IMPROVEMENT_MEMORY_PATH
+                    _mem_path = mem_path
                     if _mem_path.exists():
                         import json as _json
                         with _mem_path.open("r", encoding="utf-8") as _f:
@@ -344,14 +469,55 @@ def main():
     # Output directory — use same folder as improvement_memory.json
     # so it is always dataset-scoped
     # ------------------------------------------------------------------
-    improved_running_dir = IMPROVEMENT_MEMORY_PATH.parent / "Improved_code_running"
+    improved_running_dir = mem_path.parent / "Improved_code_running"
     improved_running_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = model_name.lower().replace(" ", "_").replace("-", "_")
     output_path = improved_running_dir / f"{safe_name}_improved_running.py"
 
     # Copy improved code to running dir
-    output_path.write_text(validation_code_path.read_text(encoding="utf-8"), encoding="utf-8")
+    improved_code_text = validation_code_path.read_text(encoding="utf-8")
+    output_path.write_text(improved_code_text, encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # IDENTITY CHECK: abort early if the "improved" code is the same as
+    # the original validation code — this means code generation failed
+    # silently (wrong memory path, LLM returned nothing, etc.)
+    # ------------------------------------------------------------------
+    original_code_path_str = improv_mem.get("validation_code_path")
+    if original_code_path_str:
+        original_path = Path(original_code_path_str)
+        if original_path.exists():
+            original_text = original_path.read_text(encoding="utf-8")
+            if improved_code_text.strip() == original_text.strip():
+                error_msg = (
+                    "Improved code is identical to the original validation code. "
+                    "Code generation did not apply any changes — "
+                    "improved_code_gen.py may have used the wrong memory path or failed silently."
+                )
+                print(f"\n[ERROR] {error_msg}")
+                try:
+                    with mem_path.open("r", encoding="utf-8") as f:
+                        mem_data = json.load(f)
+                    mem_data["improved_validation_metrics"] = baseline_metrics or {}
+                    mem_data["improvement_run_succeeded"] = False
+                    mem_data["improvement_run_error"] = error_msg
+                    with mem_path.open("w", encoding="utf-8") as f:
+                        json.dump(mem_data, f, indent=2)
+                except Exception as exc:
+                    print(f"[WARN] Could not write identity-check error to memory: {exc}")
+                return
+            else:
+                print(f"[INFO] Identity check passed — improved code differs from original.")
+        else:
+            print(f"[WARN] Original validation code not found at {original_path} — skipping identity check.")
+    else:
+        print("[WARN] validation_code_path missing from memory — skipping identity check.")
+
+    # Debug info: confirm exactly what file is being executed
+    print(f"[DEBUG] Executing improved code: {output_path}")
+    print(f"[DEBUG] File size: {output_path.stat().st_size} bytes")
+    print(f"[DEBUG] First 300 chars:\n{improved_code_text[:300]}\n")
 
     project_root = Path(__file__).resolve().parents[1]
 
@@ -385,8 +551,8 @@ def main():
             output_path.write_text(fixed, encoding="utf-8")
             continue
 
-        # Parse metrics from stdout
-        new_metrics = parse_metrics_from_stdout(stdout, task_type)
+        # Parse metrics from stdout (regex + JSON fallback + key alignment)
+        new_metrics = collect_parsed_metrics(stdout, task_type, baseline_metrics)
 
         if not new_metrics:
             print("[WARN] Could not parse metrics from stdout on this run.")
@@ -395,6 +561,8 @@ def main():
                 "The script ran but did not print metrics in the expected format.\n"
                 f"Expected metrics for {task_type}: {_TASK_METRIC_KEYS.get(task_type, [])}\n"
                 "Each metric must be printed as: print(f'METRIC_NAME: {value}')\n"
+                "Also print one line: print('INTELLIMODEL_METRICS_JSON ' + json.dumps({...})) "
+                "with the same numbers (import json if needed).\n"
                 f"Stdout was:\n{stdout[:500]}"
             )
             fixed = generate_fixed_code(
@@ -458,6 +626,10 @@ def main():
                 "  • Feature-target relationships may be too weak for further gains.\n"
                 "  • The dataset may be too small to generalise improvements reliably.\n"
             )
+        # Bug 3 fix: fall back to baseline so the frontend never shows dashes
+        if not best_metrics and baseline_metrics:
+            best_metrics = dict(baseline_metrics)
+            print("[INFO] Falling back to baseline metrics for display (no improvement achieved).")
 
     # ------------------------------------------------------------------
     # Display before/after table
@@ -476,29 +648,29 @@ def main():
     # ------------------------------------------------------------------
     output_path.write_text(best_code, encoding="utf-8")
 
-    # Always write back to memory — even empty metrics — so the frontend
-    # knows the run completed and can show a clear error rather than dashes
+    # Always write back to memory with real numbers so the frontend
+    # shows metrics instead of dashes, even when improvement failed.
     try:
-        mem_path = IMPROVEMENT_MEMORY_PATH
         if mem_path.exists():
             with mem_path.open("r", encoding="utf-8") as f:
                 mem_data = json.load(f)
-            mem_data["improved_validation_metrics"] = best_metrics  # may be {}
+            # Use best_metrics (may be baseline fallback) — never write empty {}
+            metrics_to_store = best_metrics if best_metrics else baseline_metrics
+            mem_data["improved_validation_metrics"] = metrics_to_store
             mem_data["improved_validation_code_path"] = str(output_path.resolve())
             mem_data["improvement_run_succeeded"] = succeeded
-            if not best_metrics:
+            if not succeeded:
                 mem_data["improvement_run_error"] = (
-                    "Metrics could not be captured from the improved code output. "
-                    "Check the generated script for missing print statements."
-                )
+                    "Metrics could not be improved within the allowed iterations. "
+                    "Baseline metrics are shown for reference."
+                ) if not best_metrics else None
+                if mem_data["improvement_run_error"] is None:
+                    mem_data.pop("improvement_run_error", None)
             else:
                 mem_data.pop("improvement_run_error", None)
             with mem_path.open("w", encoding="utf-8") as f:
                 json.dump(mem_data, f, indent=2)
-            if best_metrics:
-                print(f"[INFO] Updated improvement_memory.json with final metrics: {best_metrics}")
-            else:
-                print("[WARN] Wrote empty metrics to improvement_memory.json — check generated code output above.")
+            print(f"[INFO] Updated improvement_memory.json with metrics: {metrics_to_store}")
         else:
             print(f"[WARN] improvement_memory.json not found at {mem_path} — metrics not saved.")
     except Exception as exc:
@@ -506,4 +678,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    _parser = argparse.ArgumentParser(description="Run improved validation code and update memory.")
+    _parser.add_argument(
+        "--memory",
+        type=str,
+        default=None,
+        help="Absolute path to improvement_memory.json for this job (required when multiple datasets exist).",
+    )
+    _args = _parser.parse_args()
+    _explicit = Path(_args.memory).resolve() if _args.memory else None
+    main(memory_path=_explicit)
