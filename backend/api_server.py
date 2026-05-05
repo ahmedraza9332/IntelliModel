@@ -369,8 +369,36 @@ def _collect_artifacts(job: JobState) -> None:
         _copy_glob(ft_src, "*.pkl", out / "training")
 
     # Improvement artifacts
+    # Improvement agent now writes dataset-scoped files under
+    # `Improvement Agent/<dataset_name>/...`. Preserve those by copying:
+    #   1) direct files in IMPROVEMENT_DIR (legacy layout), and
+    #   2) recursively from the dataset folder inferred from improvement_memory_path.
     for pattern in ("*.py", "*.json", "*.txt"):
         _copy_glob(IMPROVEMENT_DIR, pattern, out / "improvement")
+
+    def _copy_recursive(src_root: Path, pattern: str, dest_root: Path) -> None:
+        for f in src_root.rglob(pattern):
+            if not f.is_file():
+                continue
+            try:
+                rel = f.relative_to(src_root)
+            except Exception:
+                rel = Path(f.name)
+            dst = dest_root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(str(f), str(dst))
+            except Exception:
+                pass
+
+    if job.improvement_memory_path:
+        mem_path = Path(job.improvement_memory_path)
+        if mem_path.exists():
+            dataset_dir = mem_path.parent
+            # Keep dataset folder name to avoid collisions across runs/datasets.
+            dest = out / "improvement" / dataset_dir.name
+            for pattern in ("*.py", "*.json", "*.txt"):
+                _copy_recursive(dataset_dir, pattern, dest)
 
 
 def _task_validate(job: JobState, selected_models: List[str]) -> None:
