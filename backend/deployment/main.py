@@ -435,7 +435,7 @@ _inference_sentinel_vals = df[_inference_sentinel_col].copy() if _inference_sent
         r"(df)\s*=\s*\1\.drop_duplicates\(\s*\)",
         (
             r"\1 = \1.drop_duplicates("
-            f"subset=[c for c in \1.columns if c != {sentinel_col!r}])"
+            f"subset=[c for c in \\1.columns if c != {sentinel_col!r}])"
         ),
         patched,
     )
@@ -443,7 +443,7 @@ _inference_sentinel_vals = df[_inference_sentinel_col].copy() if _inference_sent
         r"(df)\.drop_duplicates\(\s*inplace\s*=\s*True\s*\)",
         (
             r"\1.drop_duplicates("
-            f"subset=[c for c in \1.columns if c != {sentinel_col!r}], inplace=True)"
+            f"subset=[c for c in \\1.columns if c != {sentinel_col!r}], inplace=True)"
         ),
         patched,
     )

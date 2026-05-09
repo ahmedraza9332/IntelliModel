@@ -54,22 +54,35 @@ function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+const NUMERIC_DTYPES = new Set([
+  "int64", "int32", "int16", "int8",
+  "uint64", "uint32", "uint16", "uint8",
+  "float64", "float32", "float16",
+  "number", "numeric",
+]);
+
+/** True when the feature should be treated as a number. */
+function isNumericStat(stat?: FeatureStat): boolean {
+  if (!stat) return false;
+  const dt = (stat.dtype ?? "").toLowerCase();
+  return NUMERIC_DTYPES.has(dt);
+}
+
 /** Derive a human-readable hint for a feature from its stats. */
-function featureHint(name: string, stat?: FeatureStat): string | null {
+function featureHint(stat?: FeatureStat): string | null {
   if (!stat) return null;
   if (stat.field_type === "datetime") {
-    const parts: string[] = [];
-    if (stat.max_date) parts.push(`latest in data: ${stat.max_date.slice(0, 10)}`);
-    if (parts.length) return parts.join(", ");
-    return "enter a date not already in training data";
+    if (stat.max_date) return `latest in data: ${stat.max_date.slice(0, 10)}`;
+    return "enter a date";
   }
-  if (stat.binary) return "0 or 1";
-  if (stat.categories) return stat.categories.slice(0, 3).join(" / ");
-  if (stat.min != null && stat.max != null)
-    return `${stat.min} – ${stat.max}`;
-  if (stat.mean != null && stat.std != null)
-    return `avg ${stat.mean.toLocaleString(undefined, { maximumFractionDigits: 1 })} ± ${stat.std.toLocaleString(undefined, { maximumFractionDigits: 1 })}`;
-  return null;
+  if (isNumericStat(stat)) {
+    if (stat.binary) return "0 or 1";
+    if (stat.min != null && stat.max != null) return `${stat.min} – ${stat.max}`;
+    if (stat.mean != null && stat.std != null)
+      return `avg ${stat.mean.toLocaleString(undefined, { maximumFractionDigits: 1 })} ± ${stat.std.toLocaleString(undefined, { maximumFractionDigits: 1 })}`;
+    return "numeric";
+  }
+  return "text";
 }
 
 function TestForm({ deploymentInfo }: TestFormProps) {
@@ -80,7 +93,6 @@ function TestForm({ deploymentInfo }: TestFormProps) {
         feature_names.map((f) => {
           const stat = feature_stats?.[f];
           if (stat?.field_type === "datetime") return [f, todayIso()];
-          if (stat?.categories?.length) return [f, stat.categories[0]];
           return [f, String(example_predict_payload[f] ?? "")];
         })
       )
@@ -103,14 +115,16 @@ function TestForm({ deploymentInfo }: TestFormProps) {
           // script will parse it the same way the training data was parsed.
           if (!val) throw new Error(`"${f}" requires a date value.`);
           payload[f] = val;
-        } else if (stat?.categories?.length) {
-          payload[f] = val;
-        } else {
+        } else if (isNumericStat(stat)) {
           const num = parseFloat(val);
           if (isNaN(num)) {
             throw new Error(`"${f}" must be a number. Got: "${val}"`);
           }
           payload[f] = num;
+        } else {
+          // Text / categorical / object columns — send as string
+          if (!val.trim()) throw new Error(`"${f}" cannot be empty.`);
+          payload[f] = val.trim();
         }
       }
       const res = await fetch(predict_url, {
@@ -142,15 +156,15 @@ function TestForm({ deploymentInfo }: TestFormProps) {
       >
         {feature_names.map((feat) => {
           const stat = feature_stats?.[feat];
-          const hint = featureHint(feat, stat);
-          const isCategorical = !!(stat?.categories?.length);
+          const hint = featureHint(stat);
+          const isNumeric = isNumericStat(stat);
           return (
             <div key={feat}>
               <div className="flex items-center gap-1.5 mb-1">
                 <label className="text-xs text-slate-600 font-mono truncate">
                   {feat}
                 </label>
-                {hint && (stat?.field_type === "datetime" || !isCategorical) && (
+                {hint && (
                   <span className="inline-flex items-center gap-0.5 text-[10px] text-slate-400 font-sans whitespace-nowrap">
                     <Info size={9} className="text-slate-300" />
                     {hint}
@@ -166,25 +180,22 @@ function TestForm({ deploymentInfo }: TestFormProps) {
                     setValues((prev) => ({ ...prev, [feat]: e.target.value }))
                   }
                 />
-              ) : isCategorical ? (
-                <select
-                  className="pipeline-input text-xs py-2"
-                  value={values[feat] ?? ""}
-                  onChange={(e) =>
-                    setValues((prev) => ({ ...prev, [feat]: e.target.value }))
-                  }
-                >
-                  {stat!.categories!.map((cat) => (
-                    <option key={cat} value={cat}>
-                      {cat}
-                    </option>
-                  ))}
-                </select>
-              ) : (
+              ) : isNumeric ? (
                 <input
                   type="number"
                   step="any"
                   className="pipeline-input text-xs py-2"
+                  placeholder="enter a number"
+                  value={values[feat] ?? ""}
+                  onChange={(e) =>
+                    setValues((prev) => ({ ...prev, [feat]: e.target.value }))
+                  }
+                />
+              ) : (
+                <input
+                  type="text"
+                  className="pipeline-input text-xs py-2"
+                  placeholder="enter a value"
                   value={values[feat] ?? ""}
                   onChange={(e) =>
                     setValues((prev) => ({ ...prev, [feat]: e.target.value }))

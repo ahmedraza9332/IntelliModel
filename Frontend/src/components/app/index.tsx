@@ -10,7 +10,9 @@ import {
   Zap,
   TrendingUp,
   FileCode2,
+  Columns,
 } from "lucide-react";
+import { normalizePreprocessingPlanSteps } from "@/lib/preprocessingPlan";
 import { cn } from "@/lib/utils";
 import type { PipelineStep } from "@/types/pipeline";
 import type { ValidationMetricEntry } from "@/api/client";
@@ -47,24 +49,7 @@ export interface StepSummary {
   richData?: StepRichData;
 }
 
-// ─── Helper: extract preprocessing steps from plan ────────────────────────────
-
-function extractPlanSteps(
-  plan: Record<string, unknown> | null
-): Array<{ label: string; reason: string }> {
-  if (!plan) return [];
-  const raw =
-    (plan as Record<string, unknown[]>)["preprocessing_steps"] ??
-    (plan as Record<string, unknown[]>)["steps"] ??
-    [];
-  if (!Array.isArray(raw)) return [];
-  return (raw as Record<string, unknown>[]).map((s, i) => ({
-    label:
-      (s["step"] as string) ?? (s["action"] as string) ?? `Step ${i + 1}`,
-    reason:
-      (s["reason"] as string) ?? (s["justification"] as string) ?? "",
-  }));
-}
+// helper removed — using normalizePreprocessingPlanSteps from @/lib/preprocessingPlan
 
 // ─── Rich content renderers ────────────────────────────────────────────────────
 
@@ -90,7 +75,7 @@ function PreprocessingRich({
 }: {
   d: Extract<StepRichData, { kind: "preprocessing" }>;
 }) {
-  const planSteps = extractPlanSteps(d.plan);
+  const planSteps = normalizePreprocessingPlanSteps(d.plan);
   return (
     <div className="mt-3 space-y-3">
       {/* Recommended models */}
@@ -116,19 +101,41 @@ function PreprocessingRich({
       {/* Preprocessing plan steps */}
       {planSteps.length > 0 && (
         <div>
-          <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1.5">
-            Preprocessing plan
+          <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2">
+            Preprocessing plan · {planSteps.length} steps
           </p>
-          <div className="space-y-1">
-            {planSteps.map(({ label, reason }, i) => (
-              <div key={i} className="flex items-start gap-2 text-xs">
-                <CheckCircle2 size={12} className="text-emerald-500 flex-shrink-0 mt-0.5" />
-                <span>
-                  <span className="font-medium text-slate-700">{label}</span>
-                  {reason && (
-                    <span className="text-slate-400 ml-1">— {reason}</span>
+          <div className="space-y-1.5">
+            {planSteps.map((s) => (
+              <div
+                key={s.index}
+                className="flex gap-2.5 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2"
+              >
+                <div className="flex-shrink-0 w-5 h-5 rounded-full bg-emerald-50 border border-emerald-200 flex items-center justify-center text-[9px] font-bold text-emerald-600 mt-0.5">
+                  {s.index}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-semibold text-slate-800 leading-snug">
+                    {s.title}
+                  </p>
+                  {s.columns && s.columns.length > 0 && (
+                    <div className="flex items-center gap-1 flex-wrap mt-1">
+                      <Columns size={9} className="text-slate-400 flex-shrink-0" />
+                      {s.columns.map((col) => (
+                        <span
+                          key={col}
+                          className="px-1 py-0.5 rounded text-[9px] font-mono bg-white text-slate-600 border border-slate-200"
+                        >
+                          {col}
+                        </span>
+                      ))}
+                    </div>
                   )}
-                </span>
+                  {s.detail && (
+                    <p className="mt-1 text-[10px] text-slate-500 leading-relaxed">
+                      {s.detail}
+                    </p>
+                  )}
+                </div>
               </div>
             ))}
           </div>

@@ -1,10 +1,11 @@
 import { useEffect, useState, useCallback } from "react";
-import { Loader2, CheckCircle2, Sparkles, Bot } from "lucide-react";
+import { Loader2, CheckCircle2, Sparkles, Bot, ChevronDown, ChevronUp, Columns } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePoll } from "@/hooks/usePoll";
 import { getStatus, startPreprocessing } from "@/api/client";
 import type { StatusResponse } from "@/api/client";
 import { LogTerminal, ErrorBanner } from "@/components/app";
+import { normalizePreprocessingPlanSteps } from "@/lib/preprocessingPlan";
 
 interface PreprocessingResult {
   recommendedModels: string[];
@@ -22,38 +23,73 @@ function PreprocessingSteps({
 }: {
   plan: Record<string, unknown> | null;
 }) {
-  if (!plan) return null;
-  const steps =
-    (plan as Record<string, unknown[]>)["preprocessing_steps"] ??
-    (plan as Record<string, unknown[]>)["steps"] ??
-    [];
-  if (!Array.isArray(steps) || steps.length === 0) return null;
+  const [expanded, setExpanded] = useState(false);
+  const steps = normalizePreprocessingPlanSteps(plan);
+  if (steps.length === 0) return null;
+
+  const PREVIEW_COUNT = 3;
+  const visible = expanded ? steps : steps.slice(0, PREVIEW_COUNT);
+  const hidden = steps.length - PREVIEW_COUNT;
 
   return (
-    <div className="mt-4 space-y-1.5">
-      <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
-        Preprocessing plan
+    <div className="mt-5">
+      <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
+        Preprocessing Plan · {steps.length} steps
       </p>
-      {(steps as Record<string, unknown>[]).map((s, i) => {
-        const label =
-          (s["step"] as string) ?? (s["action"] as string) ?? `Step ${i + 1}`;
-        const reason =
-          (s["reason"] as string) ?? (s["justification"] as string) ?? "";
-        return (
-          <div key={i} className="flex items-start gap-2.5 text-xs">
-            <CheckCircle2
-              size={13}
-              className="text-emerald-500 flex-shrink-0 mt-0.5"
-            />
-            <div>
-              <span className="text-slate-700 font-medium">{label}</span>
-              {reason && (
-                <span className="text-slate-400 ml-1">— {reason}</span>
+      <div className="space-y-2">
+        {visible.map((s) => (
+          <div
+            key={s.index}
+            className="flex gap-3 rounded-xl bg-white border border-slate-200 px-4 py-3 shadow-sm"
+          >
+            {/* Step number badge */}
+            <div className="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-50 border border-emerald-200 flex items-center justify-center text-[10px] font-bold text-emerald-600 mt-0.5">
+              {s.index}
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-slate-800 leading-snug">
+                {s.title}
+              </p>
+              {s.columns && s.columns.length > 0 && (
+                <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
+                  <Columns size={10} className="text-slate-400 flex-shrink-0" />
+                  {s.columns.map((col) => (
+                    <span
+                      key={col}
+                      className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-slate-100 text-slate-600 border border-slate-200"
+                    >
+                      {col}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {s.detail && (
+                <p className="mt-1.5 text-xs text-slate-500 leading-relaxed">
+                  {s.detail}
+                </p>
               )}
             </div>
           </div>
-        );
-      })}
+        ))}
+      </div>
+
+      {steps.length > PREVIEW_COUNT && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-2 flex items-center gap-1 text-xs text-slate-400 hover:text-slate-600 transition-colors"
+        >
+          {expanded ? (
+            <>
+              <ChevronUp size={12} /> Show less
+            </>
+          ) : (
+            <>
+              <ChevronDown size={12} /> Show {hidden} more step{hidden !== 1 ? "s" : ""}
+            </>
+          )}
+        </button>
+      )}
     </div>
   );
 }
