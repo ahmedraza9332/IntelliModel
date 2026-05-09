@@ -30,6 +30,7 @@ if str(backend_dir) not in sys.path:
 from llm_config import DEFAULT_LLM_MODEL, DEFAULT_LLM_ENDPOINT, create_chat_llm
 
 CURRENT_DIR = Path(__file__).resolve().parent
+IMPROVEMENT_MEMORY_PATH = CURRENT_DIR / "improvement_memory.json"
 
 
 def _find_improvement_memory() -> Path:
@@ -133,6 +134,7 @@ def generate_improved_validation_code(
 ) -> str:
     """
     Prompt the LLM to rewrite the validation code incorporating the
+    improvement steps while keeping the same model type and evaluation logic.
     improvement steps.  The metric printing block is injected verbatim
     so the runner can always parse metrics from stdout.
     """
@@ -145,6 +147,12 @@ def generate_improved_validation_code(
                 "You are an expert Python ML engineer. "
                 "Improve the provided model validation/testing code by applying "
                 "ONLY the listed improvement steps. "
+                "Do NOT change the ML model type or the evaluation metric logic. "
+                "Keep the same dataset loading, train/test split strategy, and "
+                "metric printing format (MAE, MSE, R2). "
+                "Use the dataset context only for reasoning about feature names "
+                "and data characteristics. "
+                "Return ONLY valid, runnable Python code — no explanations.",
                 "Do NOT change the ML model type. "
                 "Do NOT change the train/test split ratio. "
                 "Keep the same dataset loading strategy. "
@@ -157,9 +165,11 @@ def generate_improved_validation_code(
             ),
             (
                 "user",
+                "Improvement steps:\n{steps}\n\n"
                 "Improvement steps to apply:\n{steps}\n\n"
                 "Dataset context:\n{dataset_context}\n\n"
                 "Current validation/testing code:\n{code}\n\n"
+                "Return only the improved Python code.",
                 "Return only the improved Python code with the mandatory metric block included.",
             ),
         ]
@@ -176,6 +186,7 @@ def generate_improved_validation_code(
             "metric_block": metric_block,
         }
     )
+    return _strip_code_fences(raw)
     return _sanitize_non_printable(_strip_code_fences(raw))
 
 
@@ -208,10 +219,13 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Load everything from improvement_memory.json
     # ------------------------------------------------------------------
+    if not IMPROVEMENT_MEMORY_PATH.exists():
+        print(f"[ERROR] improvement_memory.json not found at: {IMPROVEMENT_MEMORY_PATH}")
     if not improvement_memory_path.exists():
         print(f"[ERROR] improvement_memory.json not found at: {improvement_memory_path}")
         sys.exit(1)
 
+    with IMPROVEMENT_MEMORY_PATH.open("r", encoding="utf-8") as f:
     with improvement_memory_path.open("r", encoding="utf-8") as f:
         mem = json.load(f)
 
@@ -251,6 +265,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Generate improved code via LLM
     # ------------------------------------------------------------------
+    print(f"[INFO] Generating improved validation code for: {model_name}")
     print(f"[INFO] Generating improved validation code for: {model_name} (task: {task_type})")
     improved_code = generate_improved_validation_code(
         validation_code=validation_code,
@@ -263,9 +278,11 @@ def main() -> None:
     # Save to improved_training/{model_name}_improved_validation.py
     # Use same parent as improvement_memory.json for dataset scoping
     # ------------------------------------------------------------------
+    output_dir = CURRENT_DIR / "improved_training"
     output_dir = improvement_memory_path.parent / "improved_training"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    safe_name = model_name or "model"
     safe_name = (model_name or "model").lower().replace(" ", "_").replace("-", "_")
     output_file = output_dir / f"{safe_name}_improved_validation.py"
     output_file.write_text(improved_code, encoding="utf-8")

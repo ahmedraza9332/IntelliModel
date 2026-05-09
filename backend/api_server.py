@@ -48,6 +48,7 @@ Usage
     #       --reload-exclude "Improvement Agent/*"
 """
 import re
+import os
 from typing import Any, Dict
 import json
 import sys
@@ -61,16 +62,23 @@ import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
 # Path setup — mirrors Frontend/app.py _add_backend_to_path()
 # ---------------------------------------------------------------------------
 BACKEND_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = BACKEND_ROOT.parent
 PREPROCESSING_DIR = BACKEND_ROOT / "Pre Processing Agent"
 LLM_ORCHESTRATOR_DIR = BACKEND_ROOT / "LLM Orchestrator"
 IMPROVEMENT_DIR = BACKEND_ROOT / "Improvement Agent"
 DATASETS_DIR = BACKEND_ROOT / "Datasets"
 RUNS_DIR = BACKEND_ROOT / "runs"
+
+# Load env values for auth/API settings.
+# Priority: backend/.env first, then project-root .env as fallback.
+load_dotenv(BACKEND_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -243,6 +251,21 @@ def _task_preprocess_and_recommend(job: JobState) -> None:
 
             # Also save a copy to BACKEND_ROOT for the deployment server
             _sync_master_memory(mm_path)
+
+            # Training-memory catalog ingest (non-blocking).
+            # This writes a row into training_catalog.db using fingerprints computed
+            # from the per-job master_memory.json.
+            try:
+                from training_memory.ingest import record_run_after_preprocess
+
+                record_run_after_preprocess(
+                    job_id=job.job_id, master_memory_path=mm_path
+                )
+            except Exception as _tm_ingest_exc:
+                job.logs += (
+                    "\n[WARN] training_memory ingest failed (non-blocking): "
+                    f"{_tm_ingest_exc}"
+                )
 
             # Step 2 – LLM model recommendations (stops before user model selection)
             llm_agent = LLMOrchestratorWorkflowAgent(
@@ -562,6 +585,67 @@ def _patch_orchestrator_from_improvement_memory_for_train(
     llm_agent.save_memory()
 
 
+def _resolve_trained_checkpoint(output_dir: Path, model_name: str) -> Optional[Path]:
+    """
+    Best-effort resolver for the trained .pkl artifact for this job/model.
+    """
+    training_dir = output_dir / "training"
+    if not training_dir.exists():
+        return None
+
+    model_token = (
+        (model_name or "")
+        .strip()
+        .lower()
+        .replace(" ", "_")
+        .replace("-", "_")
+    )
+    candidates = sorted(
+        training_dir.glob("*.pkl"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not candidates:
+        return None
+
+    for p in reversed(candidates):
+        if model_token and model_token in p.stem.lower():
+            return p.resolve()
+    return candidates[-1].resolve()
+
+
+def _extract_metric_for_model(
+    validation_metrics: Optional[Dict[str, Any]],
+    model_name: str,
+) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    """
+    Return (metric_name, metric_value, normalized_score) where higher score is better.
+    """
+    if not validation_metrics or model_name not in validation_metrics:
+        return None, None, None
+    row = validation_metrics.get(model_name)
+    if not isinstance(row, dict):
+        return None, None, None
+
+    metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else row
+    if not isinstance(metrics, dict):
+        return None, None, None
+
+    # Prefer metrics where larger is better
+    for key in ("r2", "R2", "accuracy", "Accuracy", "f1", "F1"):
+        val = metrics.get(key)
+        if isinstance(val, (int, float)):
+            return key, float(val), float(val)
+
+    # Lower-is-better metrics mapped to higher-is-better score by negation
+    for key in ("rmse", "RMSE", "mse", "MSE", "mae", "MAE"):
+        val = metrics.get(key)
+        if isinstance(val, (int, float)):
+            f = float(val)
+            return key, f, -f
+
+    return None, None, None
+
+
 def _task_train(job: JobState, model_name: str) -> None:
     """Thread: generate + run full training code, save .pkl artifact."""
     job.status = "training"
@@ -610,7 +694,30 @@ def _task_train(job: JobState, model_name: str) -> None:
             llm_agent.generate_full_training_code(model_name)
             llm_agent.memory.selected_model_for_full_training = model_name
             llm_agent.save_memory()
-            llm_agent.run_full_training_code()
+            tm_decision = None
+            try:
+                from training_memory.decision import decide_warm_start
+
+                tm_decision = decide_warm_start(
+                    job.job_id,
+                    requested_model_name=model_name,
+                )
+                job.logs += (
+                    "\n[INFO] training_memory decision: "
+                    f"{json.dumps(tm_decision.as_dict(), separators=(',', ':'))}"
+                )
+            except Exception as _tm_decision_exc:
+                job.logs += (
+                    "\n[WARN] training_memory decision failed (non-blocking): "
+                    f"{_tm_decision_exc}"
+                )
+
+            warm_start_path = None
+            if tm_decision and tm_decision.decision == "reuse_checkpoint_candidate":
+                warm_start_path = tm_decision.candidate_checkpoint_path
+            llm_agent.run_full_training_code(
+                warm_start_checkpoint_path=warm_start_path
+            )
 
             # Resolve the generated training script path
             training_code_path: Optional[Path] = None
@@ -641,6 +748,47 @@ def _task_train(job: JobState, model_name: str) -> None:
             _sync_master_memory(master_memory_path)
 
         _collect_artifacts(job)
+        try:
+            from training_memory.artifacts import register_artifact
+
+            artifact_path = _resolve_trained_checkpoint(out, model_name)
+            if artifact_path and artifact_path.exists():
+                metric_name, metric_value, metric_score = _extract_metric_for_model(
+                    job.validation_metrics,
+                    model_name,
+                )
+                delta_raw = os.environ.get("TRAINING_MEMORY_PROMOTION_DELTA", "0.0").strip()
+                try:
+                    promotion_delta = float(delta_raw)
+                except ValueError:
+                    promotion_delta = 0.0
+
+                parent_job_id = None
+                if tm_decision and tm_decision.decision == "reuse_checkpoint_candidate":
+                    parent_job_id = tm_decision.candidate_job_id
+
+                reg = register_artifact(
+                    job_id=job.job_id,
+                    model_name=model_name,
+                    artifact_path=artifact_path,
+                    parent_job_id=parent_job_id,
+                    metric_name=metric_name,
+                    metric_value=metric_value,
+                    metric_score=metric_score,
+                    promotion_delta=promotion_delta,
+                )
+                job.logs += (
+                    "\n[INFO] training_memory artifact registered: "
+                    f"path={artifact_path}, promoted={reg.is_promoted}, "
+                    f"score={reg.current_score}, prev_best={reg.previous_best_score}"
+                )
+            else:
+                job.logs += "\n[WARN] training_memory artifact registration skipped: no .pkl found."
+        except Exception as _tm_artifact_exc:
+            job.logs += (
+                "\n[WARN] training_memory artifact registration failed (non-blocking): "
+                f"{_tm_artifact_exc}"
+            )
         job.status = "training_done"
 
     except Exception as exc:
@@ -873,6 +1021,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _init_training_memory_catalog() -> None:
+    """
+    Best-effort idempotent catalog init/backfill for existing DB files.
+    """
+    try:
+        from training_memory.db import get_connection as _tm_get_connection, init_db as _tm_init_db
+
+        conn = _tm_get_connection()
+        try:
+            _tm_init_db(conn)
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[WARN] training_memory startup DB init failed (non-blocking): {exc}")
 
 # ---------------------------------------------------------------------------
 # Pydantic request bodies
@@ -1629,6 +1794,21 @@ def api_health() -> Dict[str, Any]:
     with _jobs_lock:
         active = len(_jobs)
     return {"status": "ok", "active_jobs": active}
+
+
+try:
+    from auth.router import router as _auth_router  # type: ignore[import]
+
+    app.include_router(_auth_router)
+except Exception as exc:
+    print(f"[WARN] auth routes unavailable (non-blocking): {exc}")
+
+try:
+    from training_memory.routes import router as _training_memory_router  # type: ignore[import]
+
+    app.include_router(_training_memory_router)
+except Exception as exc:
+    print(f"[WARN] training_memory routes unavailable (non-blocking): {exc}")
 
 
 # ---------------------------------------------------------------------------

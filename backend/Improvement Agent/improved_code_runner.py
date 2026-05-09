@@ -1,3 +1,4 @@
+import os
 """
 Improved Code Runner
 
@@ -21,6 +22,7 @@ NOTE: This file does NOT generate the improved code itself.
 
 import json
 import re
+import json
 import sys
 import subprocess
 import traceback
@@ -35,6 +37,7 @@ if str(backend_dir) not in sys.path:
 
 from llm_config import DEFAULT_LLM_MODEL, DEFAULT_LLM_ENDPOINT, create_chat_llm
 
+# Import feasibility and comparison helpers from improvement_steps_generator
 current_dir = Path(__file__).resolve().parent
 if str(current_dir) not in sys.path:
     sys.path.insert(0, str(current_dir))
@@ -49,6 +52,8 @@ from improvement_steps_generator import (
 MODEL = DEFAULT_LLM_MODEL
 ENDPOINT = DEFAULT_LLM_ENDPOINT
 
+# Use improvement agent memory (written by improvement_workflow_agent.py)
+IMPROVEMENT_MEMORY_PATH = Path("Improvement Agent") / "improvement_memory.json"
 def _find_improvement_memory() -> Path:
     flat = current_dir / "improvement_memory.json"
     if flat.exists():
@@ -60,6 +65,7 @@ def _find_improvement_memory() -> Path:
                 return candidate
     return flat
 
+# Maximum self-repair iterations before giving up
 
 def resolve_improvement_memory_path(explicit: Optional[Path]) -> Path:
     """Prefer CLI --memory path; otherwise first improvement_memory.json under agent dir."""
@@ -73,9 +79,12 @@ def resolve_improvement_memory_path(explicit: Optional[Path]) -> Path:
 
 MAX_ITERATIONS = 3
 
+# Temp file used by generated code to write metrics in a machine-readable way
+METRICS_OUTPUT_FILE = Path("Improvement Agent") / "Improved_code_running" / "_temp_metrics.json"
 # Canonical metric names → regex alternation for stdout (beyond _METRIC_PATTERNS)
 _R2_ALIASES = r"(?:R2|R\^2|R²|r2)"
 
+memory: dict = {}
 
 # ============================================================
 # STDOUT METRIC PARSING  (primary capture method)
@@ -293,6 +302,11 @@ def display_metrics_comparison(
 # ============================================================
 
 def clean_code_block(text: str) -> str:
+    """
+    Extracts ONLY Python code from an LLM response.
+    Removes all text outside fences.
+    Safely handles malformed or missing fences.
+    """
     fenced = re.findall(r"```(?:python)?\s*(.*?)```", text, re.DOTALL)
     if fenced:
         return fenced[-1].strip()
@@ -351,9 +365,21 @@ def generate_fixed_code(
 
 
 # ============================================================
+# METRIC INJECTION
 # CODE EXECUTION
 # ============================================================
 
+METRICS_SNIPPET = """
+# --- Auto-injected by IntelliModel: write metrics to file for comparison ---
+import json as _json, pathlib as _pathlib
+_metrics_out = {_metrics_out_path!r}
+_pathlib.Path(_metrics_out).parent.mkdir(parents=True, exist_ok=True)
+_captured_metrics = {{}}
+# Regression metrics
+for _k, _v in [("MAE", "mae"), ("MSE", "mse"), ("R2", "r2"), ("RMSE", "rmse")]:
+    for _var in [_v, _v.upper()]:
+        try:
+            _captured_metrics[_k] = float(eval(_var))
 def run_code_subprocess(code_path: Path, cwd: Path, timeout: int = 300):
     """Execute a Python script via subprocess and return (success, stdout, stderr)."""
     try:
@@ -609,12 +635,36 @@ def main(memory_path: Optional[Path] = None) -> None:
             else:
                 print("\n✅ Improvement confirmed.")
             break
+        except Exception:
+            pass
+# Classification metrics
+for _k, _v in [
+    ("Accuracy", "accuracy"), ("Precision", "precision"),
+    ("Recall", "recall"), ("F1", "f1"), ("ROC_AUC", "roc_auc"),
+]:
+    for _var in [_v, _v.upper(), _v.capitalize()]:
+        try:
+            _captured_metrics[_k] = float(eval(_var))
         else:
             print("[WARN] No baseline metrics — accepting result as-is.")
             best_metrics = new_metrics
             best_code = output_path.read_text(encoding="utf-8")
             succeeded = True
             break
+        except Exception:
+            pass
+# Forecasting metrics
+for _k, _v in [("MAPE", "mape")]:
+    for _var in [_v, _v.upper()]:
+        try:
+            _captured_metrics[_k] = float(eval(_var))
+            break
+        except Exception:
+            pass
+_captured_metrics = {{k: v for k, v in _captured_metrics.items() if v is not None}}
+_pathlib.Path(_metrics_out).write_text(_json.dumps(_captured_metrics, indent=2))
+# --- End auto-injected block ---
+"""
 
     if not succeeded:
         print(f"\n⚠️  Reached maximum iterations ({MAX_ITERATIONS}) without confirmed improvement.")
@@ -631,6 +681,27 @@ def main(memory_path: Optional[Path] = None) -> None:
             best_metrics = dict(baseline_metrics)
             print("[INFO] Falling back to baseline metrics for display (no improvement achieved).")
 
+def inject_metrics_export(code: str, metrics_out_path: str) -> str:
+    """
+    Append a metrics-export snippet to the generated code so that
+    regression / classification / forecasting metrics are written to a
+    JSON file after execution.  Only appended if any known metric
+    variable name is present in the code.
+    """
+    _metric_vars = [
+        # regression
+        "mae", "mse", "r2", "rmse", "MAE", "MSE", "R2", "RMSE",
+        # classification
+        "accuracy", "precision", "recall", "f1", "roc_auc",
+        "Accuracy", "Precision", "Recall", "F1", "ROC_AUC",
+        # forecasting
+        "mape", "MAPE",
+    ]
+    has_metrics = any(var in code for var in _metric_vars)
+    if not has_metrics:
+        return code
+    snippet = METRICS_SNIPPET.format(_metrics_out_path=metrics_out_path)
+    return code + "\n" + snippet
     # ------------------------------------------------------------------
     # Display before/after table
     # ------------------------------------------------------------------
@@ -648,9 +719,21 @@ def main(memory_path: Optional[Path] = None) -> None:
     # ------------------------------------------------------------------
     output_path.write_text(best_code, encoding="utf-8")
 
+def read_metrics_from_file(metrics_path: Path) -> dict:
+    """
+    Read metrics written by the injected snippet.
+    Returns empty dict if file does not exist or is malformed.
+    """
+    if not metrics_path.exists():
+        return {}
     # Always write back to memory with real numbers so the frontend
     # shows metrics instead of dashes, even when improvement failed.
     try:
+        raw = metrics_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return {k: float(v) for k, v in data.items() if v is not None}
+    except Exception:
+        return {}
         if mem_path.exists():
             with mem_path.open("r", encoding="utf-8") as f:
                 mem_data = json.load(f)
@@ -677,9 +760,36 @@ def main(memory_path: Optional[Path] = None) -> None:
         print(f"[WARN] Could not update improvement_memory.json: {exc}")
 
 
+def parse_metrics_from_stdout(stdout: str) -> dict:
+    """
+    Fallback: parse regression / classification / forecasting metrics
+    from printed stdout using regex.  Handles both 'KEY: value' and
+    'KEY = value' formats.
+    """
+    num_pattern = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+    metrics: dict = {}
 if __name__ == "__main__":
     import argparse
 
+    _patterns = {
+        # regression
+        "MAE":       rf"MAE\s*[:\s=]+{num_pattern}",
+        "MSE":       rf"MSE\s*[:\s=]+{num_pattern}",
+        "RMSE":      rf"RMSE\s*[:\s=]+{num_pattern}",
+        "R2":        rf"R2[^:=\w]*[:\s=]+{num_pattern}",
+        # classification
+        "Accuracy":  rf"Accuracy\s*[:\s=]+{num_pattern}",
+        "Precision": rf"Precision\s*[:\s=]+{num_pattern}",
+        "Recall":    rf"Recall\s*[:\s=]+{num_pattern}",
+        "F1":        rf"F1[^:=\w]*[:\s=]+{num_pattern}",
+        "ROC_AUC":   rf"ROC_AUC\s*[:\s=]+{num_pattern}",
+        # forecasting
+        "MAPE":      rf"MAPE\s*[:\s=]+{num_pattern}",
+    }
+    # Also try the cross-validated R2 label some generated scripts print
+    _extra_r2 = re.search(
+        rf"Mean\s+Cross-validated\s+R2\s+score\s*[:\s=]+{num_pattern}",
+        stdout, re.IGNORECASE,
     _parser = argparse.ArgumentParser(description="Run improved validation code and update memory.")
     _parser.add_argument(
         "--memory",
@@ -687,6 +797,395 @@ if __name__ == "__main__":
         default=None,
         help="Absolute path to improvement_memory.json for this job (required when multiple datasets exist).",
     )
+
+    for key, pattern in _patterns.items():
+        m = re.search(pattern, stdout, re.IGNORECASE)
+        if m:
+            try:
+                metrics[key] = float(m.group(1))
+            except ValueError:
+                pass
+
+    if "R2" not in metrics and _extra_r2:
+        try:
+            metrics["R2"] = float(_extra_r2.group(1))
+        except ValueError:
+            pass
+
+    return metrics
+
+
+# ============================================================
+# LLM CODE GENERATION
+# ============================================================
+
+def generate_improved_code(existing_code, improvement_steps, dataset_context):
+    PROMPT = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are an expert Python ML engineer. Improve the provided validation/testing code "
+                "using ONLY the listed improvement steps. Do not modify the ML model logic. "
+                "Use dataset context only for reasoning. Respond with ONLY Python code."
+            ),
+            (
+                "user",
+                "Improvement steps:\n{steps}\n\n"
+                "Dataset context:\n{dataset_context}\n\n"
+                "Current code:\n{code}\n\n"
+                "Return only updated Python code."
+            ),
+        ]
+    )
+
+    llm = create_chat_llm(model=MODEL, endpoint=ENDPOINT, temperature=0.1)
+    chain = PROMPT | llm | StrOutputParser()
+
+    raw = chain.invoke({
+        "steps": improvement_steps,
+        "dataset_context": dataset_context,
+        "code": existing_code,
+    })
+
+    return clean_code_block(raw)
+
+
+def generate_fixed_code(original_code, error_text, improvement_steps, dataset_context):
+    """
+    Fixed version using the same prompt structure as initial code generation.
+    """
+    FIX_PROMPT = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are an expert Python ML engineer. Fix the provided validation/testing code "
+                "without changing the model logic or evaluation semantics. Maintain the exact "
+                "intent of the improvement steps. Use the dataset context only for reasoning. "
+                "Return ONLY valid Python code. No explanations."
+            ),
+            (
+                "user",
+                "Improvement steps (DO NOT DEVIATE FROM THESE STEPS):\n{steps}\n\n"
+                "Dataset context:\n{dataset_context}\n\n"
+                "Current code:\n{code}\n\n"
+                "Execution error traceback:\n{error}\n\n"
+                "Return only corrected Python code."
+            ),
+        ]
+    )
+
+    llm = create_chat_llm(model=MODEL, endpoint=ENDPOINT, temperature=0.1)
+    chain = FIX_PROMPT | llm | StrOutputParser()
+
+    raw = chain.invoke({
+        "steps": improvement_steps,
+        "dataset_context": dataset_context,
+        "code": original_code,
+        "error": error_text,
+    })
+
+    return clean_code_block(raw)
+
+
+# ============================================================
+# CODE EXECUTION (subprocess — no exec() black hole)
+# ============================================================
+
+def run_code_subprocess(code_path: Path, cwd: Path, timeout: int = 300):
+    """
+    Execute a Python script via subprocess and return (success, stdout, stderr).
+    Uses subprocess instead of exec() so that all printed output is captured.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, str(code_path)],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        success = result.returncode == 0
+        return success, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, "", "[TIMEOUT] Script exceeded time limit."
+    except Exception as exc:
+        return False, "", traceback.format_exc()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print("=== IMPROVEMENT Workflow Agent ===")
+
+    # ------------------------------------------------------------------
+    # Load paths and context from improvement memory
+    # ------------------------------------------------------------------
+    if not IMPROVEMENT_MEMORY_PATH.exists():
+        print(f"[ERROR] improvement_memory.json not found at: {IMPROVEMENT_MEMORY_PATH}")
+        return
+
+    with IMPROVEMENT_MEMORY_PATH.open("r", encoding="utf-8") as f:
+        improv_mem = json.load(f)
+
+    dataset_context = improv_mem.get("dataset_context")
+    improvement_steps_path = improv_mem.get("improvement_steps_path")
+    validation_code_path = improv_mem.get("improved_validation_code_path") or improv_mem.get(
+        "validation_code_path"
+    )
+    baseline_metrics = improv_mem.get("validation_metrics") or {}
+    dataset_report_path = improv_mem.get("dataset_report_path")
+
+    missing = []
+    if not dataset_context:
+        missing.append("dataset_context")
+    if not improvement_steps_path:
+        missing.append("improvement_steps_path")
+    if not validation_code_path:
+        missing.append("improved_validation_code_path/validation_code_path")
+
+    if missing:
+        print("[ERROR] Missing required fields in improvement_memory.json:")
+        for m in missing:
+            print(f"  - {m}")
+        return
+
+    memory["dataset_context"] = dataset_context
+
+    improvement_steps_path = Path(improvement_steps_path)
+    validation_code_path = Path(validation_code_path)
+
+    if not improvement_steps_path.exists():
+        print(f"[ERROR] improvement_steps file not found: {improvement_steps_path}")
+        return
+    if not validation_code_path.exists():
+        print(f"[ERROR] validation code file not found: {validation_code_path}")
+        return
+
+    with improvement_steps_path.open("r", encoding="utf-8") as f:
+        improvement_steps = f.read()
+
+    with validation_code_path.open("r", encoding="utf-8") as f:
+        validation_code = f.read()
+
+    # ------------------------------------------------------------------
+    # Feasibility check using dataset report
+    # ------------------------------------------------------------------
+    dataset_report_str = None
+    if dataset_report_path:
+        dp = Path(dataset_report_path)
+        if dp.exists():
+            dataset_report_str = dp.read_text(encoding="utf-8")
+
+    if dataset_report_str:
+        print("\n[INFO] Running improvement feasibility checks...")
+        feasibility = check_improvement_feasibility(dataset_report_str, baseline_metrics)
+        msg = format_feasibility_message(feasibility)
+        if msg:
+            print(msg)
+        if not feasibility["feasible"]:
+            print(
+                "\n[INFO] Improvement agent halted. "
+                "Reasons have been displayed above. No code changes were made."
+            )
+            return
+    else:
+        print("[WARN] Dataset report not available — skipping feasibility checks.")
+
+    # ------------------------------------------------------------------
+    # Output directory setup
+    # ------------------------------------------------------------------
+    improvement_agent_dir = IMPROVEMENT_MEMORY_PATH.parent
+    improved_code_running_dir = improvement_agent_dir / "Improved_code_running"
+    improved_code_running_dir.mkdir(parents=True, exist_ok=True)
+
+    model_name = improv_mem.get("model_name", "model")
+    output_filename = f"{model_name}_improved_running.py"
+    output_path = improved_code_running_dir / output_filename
+
+    # Clean up any stale temp metrics file from a previous run
+    metrics_out_path = METRICS_OUTPUT_FILE
+    if metrics_out_path.exists():
+        metrics_out_path.unlink()
+
+    # ------------------------------------------------------------------
+    # Generate improved code
+    # ------------------------------------------------------------------
+    print("\nImproving validation script...")
+    improved_code = generate_improved_code(
+        validation_code,
+        improvement_steps,
+        memory["dataset_context"],
+    )
+
+    # Inject metrics export so we can read results back reliably
+    improved_code_with_export = inject_metrics_export(
+        improved_code, str(metrics_out_path.resolve())
+    )
+
+    # Write initial version to disk so subprocess can run it
+    output_path.write_text(improved_code_with_export, encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Iteration loop: run → compare → fix or revert
+    # ------------------------------------------------------------------
+    iteration = 0
+    best_code = improved_code_with_export
+    best_metrics = {}
+    best_code_is_baseline = False  # tracks if we had to revert fully
+
+    project_root = Path(__file__).resolve().parents[1]
+
+    while iteration < MAX_ITERATIONS:
+        print(f"\n=== Running improved validation code (Iteration {iteration + 1}/{MAX_ITERATIONS}) ===")
+
+        success, stdout, stderr = run_code_subprocess(output_path, cwd=project_root)
+
+        if stdout:
+            print(stdout)
+        if stderr and not success:
+            print(f"[STDERR]\n{stderr}")
+
+        if not success:
+            # Syntax / runtime error — ask LLM to fix
+            print(f"[ERROR] Script failed. Sending to LLM for repair (iteration {iteration + 1})...")
+            error_detail = f"STDERR:\n{stderr}\nSTDOUT:\n{stdout}"
+            fixed_code = generate_fixed_code(
+                original_code=output_path.read_text(encoding="utf-8"),
+                error_text=error_detail,
+                improvement_steps=improvement_steps,
+                dataset_context=memory["dataset_context"],
+            )
+            fixed_code_with_export = inject_metrics_export(
+                fixed_code, str(metrics_out_path.resolve())
+            )
+            output_path.write_text(fixed_code_with_export, encoding="utf-8")
+            iteration += 1
+            continue
+
+        # Script ran — now read back metrics from the JSON file
+        new_metrics = read_metrics_from_file(metrics_out_path)
+        if not new_metrics:
+            # Fallback: parse from stdout
+            new_metrics = parse_metrics_from_stdout(stdout)
+
+        if not new_metrics:
+            print("[WARN] Could not capture metrics from this run. Treating as no improvement.")
+            iteration += 1
+            continue
+
+        print(f"\n[INFO] Metrics captured: {new_metrics}")
+
+        # ------------------------------------------------------------------
+        # Compare against baseline
+        # ------------------------------------------------------------------
+        if baseline_metrics:
+            comparison = compare_metrics(baseline_metrics, new_metrics)
+            print("\n" + comparison["summary"])
+
+            if comparison["regressed"]:
+                print(
+                    "\n❌ Metrics regressed — this version will NOT be saved. "
+                    "Attempting further repair..."
+                )
+                # Ask the LLM to fix with explicit regression context
+                regression_error = (
+                    f"The improved code made metrics WORSE compared to the baseline.\n"
+                    f"Baseline: {json.dumps(baseline_metrics)}\n"
+                    f"Result:   {json.dumps(new_metrics)}\n"
+                    f"Please revise the improvement steps to avoid overfitting or "
+                    f"reducing validation performance."
+                )
+                fixed_code = generate_fixed_code(
+                    original_code=output_path.read_text(encoding="utf-8"),
+                    error_text=regression_error,
+                    improvement_steps=improvement_steps,
+                    dataset_context=memory["dataset_context"],
+                )
+                fixed_code_with_export = inject_metrics_export(
+                    fixed_code, str(metrics_out_path.resolve())
+                )
+                output_path.write_text(fixed_code_with_export, encoding="utf-8")
+                iteration += 1
+                continue
+
+            if comparison["no_change"]:
+                print(
+                    f"\n— No meaningful change (threshold={MIN_IMPROVEMENT_THRESHOLD*100:.0f}%). "
+                    "Stopping early."
+                )
+                best_metrics = new_metrics
+                best_code = output_path.read_text(encoding="utf-8")
+                break
+
+            # Genuine improvement
+            best_metrics = new_metrics
+            best_code = output_path.read_text(encoding="utf-8")
+            print("\n✅ Improvement confirmed. Saving best version.")
+            break
+
+        else:
+            # No baseline to compare against — accept the result
+            print("[WARN] No baseline metrics available for comparison. Accepting result as-is.")
+            best_metrics = new_metrics
+            best_code = output_path.read_text(encoding="utf-8")
+            break
+
+    else:
+        # Exhausted all iterations without a confirmed improvement
+        print(
+            f"\n⚠️  Reached maximum iterations ({MAX_ITERATIONS}) without confirmed improvement."
+        )
+        if best_metrics and baseline_metrics:
+            comparison = compare_metrics(baseline_metrics, best_metrics)
+            print(comparison["summary"])
+        elif baseline_metrics:
+            print(
+                "❌ Could not improve metrics. The original validation code will be retained.\n"
+                "Possible reasons based on the dataset:\n"
+                "  • The model may already be near its performance ceiling on this data.\n"
+                "  • Feature-target relationships may be too weak for further gains.\n"
+                "  • The dataset may be too small to generalise improvements reliably.\n"
+                "Consider reviewing the dataset report for more details."
+            )
+            best_code_is_baseline = True
+
+    # ------------------------------------------------------------------
+    # Save final code
+    # ------------------------------------------------------------------
+    if best_code_is_baseline:
+        print("\n[INFO] No improvement achieved. Original validation code retained unchanged.")
+    else:
+        output_path.write_text(best_code, encoding="utf-8")
+        print(f"\n✅ Final improved validation code saved to: {output_path}")
+
+    # ------------------------------------------------------------------
+    # Write final metrics back to improvement memory
+    # ------------------------------------------------------------------
+    if best_metrics and IMPROVEMENT_MEMORY_PATH.exists():
+        try:
+            with IMPROVEMENT_MEMORY_PATH.open("r", encoding="utf-8") as f:
+                mem_data = json.load(f)
+            mem_data["improved_validation_metrics"] = best_metrics
+            mem_data["improved_validation_code_path"] = str(output_path.resolve())
+            with IMPROVEMENT_MEMORY_PATH.open("w", encoding="utf-8") as f:
+                json.dump(mem_data, f, indent=2)
+            print(f"[INFO] Updated improvement_memory.json with final metrics: {best_metrics}")
+        except Exception as exc:
+            print(f"[WARN] Could not update improvement_memory.json: {exc}")
+
+    # Clean up temp metrics file
+    if metrics_out_path.exists():
+        try:
+            metrics_out_path.unlink()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
     _args = _parser.parse_args()
     _explicit = Path(_args.memory).resolve() if _args.memory else None
     main(memory_path=_explicit)

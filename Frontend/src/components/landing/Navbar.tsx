@@ -1,14 +1,158 @@
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
+import { GoogleLogin } from "@react-oauth/google";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Menu, X } from "lucide-react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
+import type { AuthUser } from "@/api/client";
+import { getAuthMe, logoutAuth, signInWithGoogle } from "@/api/client";
+
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID ?? "";
 
 const Navbar = () => {
   const [isScrolled, setIsScrolled] = useState(false);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(!GOOGLE_CLIENT_ID);
   const location = useLocation();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!GOOGLE_CLIENT_ID) return;
+    let cancelled = false;
+    getAuthMe()
+      .then((u) => {
+        if (!cancelled) setUser(u);
+      })
+      .finally(() => {
+        if (!cancelled) setAuthChecked(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await logoutAuth();
+      setUser(null);
+      navigate("/");
+      toast.error("Google sign in required.");
+    } catch {
+      toast.error("Could not sign out");
+    }
+  }, [navigate]);
+
+  const handleGoogleSuccess = useCallback(async (credential: string) => {
+    try {
+      const u = await signInWithGoogle(credential);
+      setUser(u);
+      toast.success("Signed in");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Sign-in failed";
+      toast.error(msg);
+    }
+  }, []);
+
+  const handleTryNowClick = useCallback(
+    (event: React.MouseEvent) => {
+      if (GOOGLE_CLIENT_ID && !user) {
+        event.preventDefault();
+        navigate("/");
+        toast.error("Google sign in required.");
+        closeMenu();
+      }
+    },
+    [navigate, user]
+  );
+
+  const renderAuth = (variant: "desktop" | "mobile") => {
+    if (!GOOGLE_CLIENT_ID) return null;
+
+    if (!authChecked) {
+      return (
+        <span
+          className={cn(
+            "text-sm text-muted-foreground",
+            variant === "mobile" && "py-2"
+          )}
+        >
+          ...
+        </span>
+      );
+    }
+
+    if (user) {
+      const initial =
+        user.name?.trim()?.charAt(0)?.toUpperCase() ??
+        user.email?.trim()?.charAt(0)?.toUpperCase() ??
+        "?";
+      return (
+        <div
+          className={cn(
+            "flex items-center gap-2",
+            variant === "mobile" && "flex-col w-full gap-3 py-2"
+          )}
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <Avatar className="h-8 w-8 shrink-0">
+              {user.picture_url ? (
+                <AvatarImage src={user.picture_url} alt="" />
+              ) : null}
+              <AvatarFallback className="text-xs bg-slate-200 text-slate-700">
+                {initial}
+              </AvatarFallback>
+            </Avatar>
+            <span
+              className={cn(
+                "text-sm text-slate-700 dark:text-gray-200 truncate max-w-[140px]",
+                variant === "mobile" && "max-w-none text-center"
+              )}
+              title={user.email ?? user.name ?? undefined}
+            >
+              {user.name ?? user.email ?? "Account"}
+            </span>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={cn(variant === "mobile" && "w-full")}
+            onClick={() => {
+              void handleLogout();
+              closeMenu();
+            }}
+          >
+            Sign out
+          </Button>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        className={cn(
+          "flex items-center [&_iframe]:!shadow-none",
+          variant === "mobile" && "justify-center py-2"
+        )}
+      >
+        <GoogleLogin
+          onSuccess={(res) => {
+            if (res.credential) void handleGoogleSuccess(res.credential);
+          }}
+          onError={() => toast.error("Google Sign-In error")}
+          useOneTap={false}
+          size="medium"
+          theme="outline"
+          text="signin_with"
+          shape="pill"
+        />
+      </div>
+    );
+  };
 
   useEffect(() => {
     const handleScroll = () => {
@@ -161,10 +305,14 @@ const Navbar = () => {
           >
             Contact
           </Link>
+          {renderAuth("desktop")}
           <Link
             to="/try-now"
             className="inline-flex items-center justify-center rounded-full bg-gradient-to-r from-pulse-500 via-orange-500 to-purple-600 px-5 py-2 font-medium text-white shadow-lg transition-all duration-300 hover:shadow-xl hover:from-pulse-600 hover:via-orange-600 hover:to-purple-700 focus:outline-none focus:ring-2 focus:ring-pulse-300"
-            onClick={closeMenu}
+            onClick={(event) => {
+              handleTryNowClick(event);
+              closeMenu();
+            }}
           >
             Try Now
           </Link>
@@ -232,10 +380,14 @@ const Navbar = () => {
           >
             Contact
           </Link>
+          {renderAuth("mobile")}
           <Link
             to="/try-now"
             className="text-xl font-semibold py-3 px-6 w-full text-center rounded-full bg-gradient-to-r from-pulse-500 via-orange-500 to-purple-600 text-white shadow-lg hover:shadow-xl transition-all duration-300"
-            onClick={closeMenu}
+            onClick={(event) => {
+              handleTryNowClick(event);
+              closeMenu();
+            }}
           >
             Try Now
           </Link>

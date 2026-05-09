@@ -126,6 +126,7 @@ def fix_code_with_llm(code: str, error: str, plan_json: str, dataset_context: st
             "dataset_context": dataset_context,
         }
     )
+    return extract_code_snippet(fixed)
     return sanitize_non_printable(extract_code_snippet(fixed))
 
 

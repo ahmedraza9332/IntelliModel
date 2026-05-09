@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 def load_memory():
@@ -80,6 +81,7 @@ def choose_model(validation_dict):
         print("Invalid choice. Try again.")
 
 
+def improvement_menu():
 def not_satisfied_menu():
     """
     Shown when the user is not happy with validation results.
@@ -88,12 +90,59 @@ def not_satisfied_menu():
     deployment — it is NOT available at this stage.
     """
     print("\nWhat would you like to do next?")
+    print("1. Run improvement agent")
+    print("2. Reselect models")
+    print("3. Exit")
     print("1. Reselect models and re-run validation")
     print("2. Exit")
 
     while True:
         option = input("Enter option: ").strip()
         if option == "1":
+            # Load master_memory.json
+            master_memory = load_master_memory()
+            if not master_memory:
+                return
+            
+            # Get the list of models from selected_models_for_validation
+            if "llm_orchestrator" not in master_memory:
+                master_memory["llm_orchestrator"] = {}
+            if "orchestrator_memory" not in master_memory["llm_orchestrator"]:
+                master_memory["llm_orchestrator"]["orchestrator_memory"] = {}
+            
+            orchestrator_memory = master_memory["llm_orchestrator"]["orchestrator_memory"]
+            models_list = orchestrator_memory.get("selected_models_for_validation", [])
+            
+            if not models_list:
+                print("[ERROR] No models found in selected_models_for_validation.")
+                return
+            
+            # Display models and let user select
+            print("\nSelect the model you would like to improve:")
+            for idx, model_name in enumerate(models_list, start=1):
+                print(f"{idx}. {model_name}")
+            
+            while True:
+                choice = input("Enter the number of the model: ").strip()
+                if choice.isdigit() and 1 <= int(choice) <= len(models_list):
+                    selected_model = models_list[int(choice) - 1]
+                    print(f"\n[INFO] You selected: {selected_model}")
+                    
+                    # Update master_memory.json
+                    orchestrator_memory["selected_model_for_full_training"] = selected_model
+                    save_master_memory(master_memory)
+                    print(f"[INFO] Selected model '{selected_model}' saved to master_memory.json")
+                    
+                    # Also update orchestrator_memory.json to keep them in sync
+                    orchestrator_memory_local = load_memory()
+                    if orchestrator_memory_local:
+                        orchestrator_memory_local["selected_model_for_full_training"] = selected_model
+                        save_memory(orchestrator_memory_local)
+                        print(f"[INFO] Selected model '{selected_model}' saved to orchestrator_memory.json")
+                    
+                    print("\n[INFO] Improvement Agent will run here.\n")
+                    return
+                print("Invalid choice. Try again.")
             print("\n[INFO] Requesting model reselection in LLM Orchestrator workflow.\n")
             memory = load_memory()
             if memory:
@@ -101,10 +150,76 @@ def not_satisfied_menu():
                 save_memory(memory)
             return {"action": "reselect_models"}
         elif option == "2":
+            print("\n[INFO] Requesting model reselection in LLM Orchestrator workflow.\n")
+            # Signal to the orchestrator that models should be reselected.
+            # Persist this intent in orchestrator_memory.json so the workflow agent can see it.
+            memory = load_memory()
+            if memory:
+                memory["review_action"] = "reselect_models"
+                save_memory(memory)
+            return {"action": "reselect_models"}
+        elif option == "3":
             print("\n[INFO] Exiting program.\n")
             exit(0)
         else:
+            print("Invalid input. Try again.")
             print("Invalid input. Enter 1 or 2.")
+
+
+def load_master_memory():
+    """Load master_memory.json from project root"""
+def save_memory(memory_data):
+    """Save memory back to orchestrator_memory.json"""
+    script_dir = Path(__file__).parent
+    master_memory_file = script_dir.parent / "master_memory.json"
+    
+    if not master_memory_file.exists():
+        print(f"[ERROR] master_memory.json not found at: {master_memory_file}")
+    memory_file = script_dir / "orchestrator_memory.json"
+    with open(memory_file, "w", encoding="utf-8") as f:
+        json.dump(memory_data, f, indent=2)
+
+
+def main():
+    memory = load_memory()
+    if not memory:
+        return None
+    try:
+        with open(master_memory_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as exc:
+        print(f"[ERROR] master_memory.json is corrupted (invalid JSON): {exc}")
+        print(f"        Please delete or repair: {master_memory_file}")
+
+    validation_dict = memory.get("validation_metrics", {})
+    if not validation_dict:
+        print("[ERROR] No validation metrics found inside orchestrator_memory.json.")
+        return None
+
+    # Print all model metrics
+    print_model_metrics(validation_dict)
+
+def save_master_memory(master_memory_data):
+    """Save memory back to master_memory.json"""
+    script_dir = Path(__file__).parent
+    master_memory_file = script_dir.parent / "master_memory.json"
+    with open(master_memory_file, "w", encoding="utf-8") as f:
+        json.dump(master_memory_data, f, indent=2)
+    # Ask if user is satisfied with the validation results
+    satisfied = ask_yes_no("Are you satisfied with these results?")
+    if satisfied == "y":
+        # User picks the model to train on the full dataset → deployment follows automatically
+        result = choose_model(validation_dict)
+        if result and result.get("action") == "generate_full_training":
+            selected_model = result.get("model")
+            memory["selected_model_for_full_training"] = selected_model
+            save_memory(memory)
+            print(f"[INFO] Selected model '{selected_model}' saved to orchestrator_memory.json")
+        return result
+    else:
+        # Not satisfied — user can only reselect models or exit.
+        # The improvement agent is available AFTER full training + deployment, not here.
+        return not_satisfied_menu()
 
 
 def save_memory(memory_data):
@@ -128,21 +243,26 @@ def main():
     # Print all model metrics
     print_model_metrics(validation_dict)
 
-    # Ask if user is satisfied with the validation results
+    # Ask if user is satisfied
     satisfied = ask_yes_no("Are you satisfied with these results?")
     if satisfied == "y":
-        # User picks the model to train on the full dataset → deployment follows automatically
         result = choose_model(validation_dict)
+        # Save the selected model directly to orchestrator_memory.json
         if result and result.get("action") == "generate_full_training":
             selected_model = result.get("model")
             memory["selected_model_for_full_training"] = selected_model
             save_memory(memory)
             print(f"[INFO] Selected model '{selected_model}' saved to orchestrator_memory.json")
+            return result
+        elif result:
+            # User selected a model but chose not to generate full training code
+            # Still save the selection (optional, or clear it)
+            memory["selected_model_for_full_training"] = None
+            save_memory(memory)
         return result
     else:
-        # Not satisfied — user can only reselect models or exit.
-        # The improvement agent is available AFTER full training + deployment, not here.
-        return not_satisfied_menu()
+        menu_result = improvement_menu()
+        return menu_result
 
 
 if __name__ == "__main__":

@@ -25,6 +25,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function authRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  return request<T>(path, {
+    ...init,
+    credentials: init?.credentials ?? "include",
+  });
+}
+
 function json(path: string, body: unknown, method = "POST") {
   return request(path, {
     method,
@@ -251,4 +258,41 @@ export async function updateTargetColumn(
 /** GET /api/health — server heartbeat. */
 export async function apiHealth(): Promise<{ status: string }> {
   return request<{ status: string }>("/api/health");
+}
+
+// ─── Google Sign-In / session (cookie `im_session` on API origin) ────────────
+
+export interface AuthUser {
+  id: number;
+  email: string | null;
+  email_verified: boolean;
+  name: string | null;
+  picture_url: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** POST /api/auth/google — verify ID token, upsert user, set session cookie. */
+export async function signInWithGoogle(credential: string): Promise<AuthUser> {
+  return authRequest<AuthUser>("/api/auth/google", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ credential }),
+  });
+}
+
+/** GET /api/auth/me — current user from session cookie, or null if anonymous. */
+export async function getAuthMe(): Promise<AuthUser | null> {
+  const res = await fetch(`${API_BASE}/api/auth/me`, { credentials: "include" });
+  if (res.status === 401) return null;
+  if (!res.ok) return null;
+  return res.json() as Promise<AuthUser>;
+}
+
+/** POST /api/auth/logout — clear session server-side and remove cookie. */
+export async function logoutAuth(): Promise<void> {
+  await fetch(`${API_BASE}/api/auth/logout`, {
+    method: "POST",
+    credentials: "include",
+  });
 }

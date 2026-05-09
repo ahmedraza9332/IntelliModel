@@ -15,26 +15,38 @@ MEMORY_FILE = BASE_DIR / "master_memory.json"
 DEFAULT_MODEL = DEFAULT_LLM_MODEL
 DEFAULT_ENDPOINT = DEFAULT_LLM_ENDPOINT
 
+MIN_IMPROVEMENT_THRESHOLD = 0.01  # 1%
 MIN_IMPROVEMENT_THRESHOLD = 0.01  # 1% relative improvement required
 
 # ============================================================
 # METRIC DEFINITIONS PER TASK TYPE
 # ============================================================
 
+# For each metric: (direction, "higher"|"lower")
 # For each metric: direction "higher"|"lower"
 _METRIC_DIRECTION = {
     # Regression
+    "MAE":      "lower",
+    "MSE":      "lower",
+    "RMSE":     "lower",
+    "R2":       "higher",
     "MAE":       "lower",
     "MSE":       "lower",
     "RMSE":      "lower",
     "R2":        "higher",
     # Classification
+    "Accuracy": "higher",
+    "Precision":"higher",
+    "Recall":   "higher",
+    "F1":       "higher",
+    "ROC_AUC":  "higher",
     "Accuracy":  "higher",
     "Precision": "higher",
     "Recall":    "higher",
     "F1":        "higher",
     "ROC_AUC":   "higher",
     # Forecasting
+    "MAPE":     "lower",
     "MAPE":      "lower",
 }
 
@@ -234,6 +246,7 @@ def compare_metrics(baseline: dict, improved: dict, task_type: str = "regression
     a consistent *relative* threshold so that small but real R² / F1 gains
     are not incorrectly reported as "no change".
     """
+    # Determine which metric keys to compare for this task
     metric_keys = _TASK_METRIC_KEYS.get(task_type, _TASK_METRIC_KEYS["regression"])
 
     # Also accept any metric that exists in both dicts (forward-compatibility)
@@ -271,12 +284,23 @@ def compare_metrics(baseline: dict, improved: dict, task_type: str = "regression
 
         if direction == "lower":
             # Negative diff = improvement for lower-is-better metrics
+            if base_val != 0:
+                relative = abs(diff) / abs(base_val)
+                if diff < 0 and relative >= MIN_IMPROVEMENT_THRESHOLD:
+                    improved_count += 1
+                elif diff > 0 and relative >= MIN_IMPROVEMENT_THRESHOLD:
+                    regressed_count += 1
             if diff < 0 and meaningful:
                 improved_count += 1
             elif diff > 0 and meaningful:
                 regressed_count += 1
         else:
             # Positive diff = improvement for higher-is-better metrics
+            if abs(diff) >= MIN_IMPROVEMENT_THRESHOLD:
+                if diff > 0:
+                    improved_count += 1
+                else:
+                    regressed_count += 1
             if diff > 0 and meaningful:
                 improved_count += 1
             elif diff < 0 and meaningful:

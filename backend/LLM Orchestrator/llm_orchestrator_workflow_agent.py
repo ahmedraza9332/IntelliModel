@@ -716,7 +716,9 @@ class LLMOrchestratorWorkflowAgent:
                 f"Failed to generate full training code for {model_name}."
             ) from exc
     
-    def run_full_training_code(self) -> None:
+    def run_full_training_code(
+        self, warm_start_checkpoint_path: Optional[str] = None
+    ) -> None:
         """
         Run the full-training code via run_full_training_code_with_llm.py.
         The runner executes the generated full-training script and fixes errors with LLM if needed;
@@ -733,9 +735,16 @@ class LLMOrchestratorWorkflowAgent:
         print("="*60)
         print("Running full training code via run_full_training_code_with_llm.py")
         try:
+            env = os.environ.copy()
+            if warm_start_checkpoint_path:
+                env["INTELLIMODEL_WARM_START_PATH"] = warm_start_checkpoint_path
+                print(
+                    f"[INFO] Warm-start checkpoint candidate: {warm_start_checkpoint_path}"
+                )
             subprocess.run(
                 [sys.executable, str(runner_script)],
                 cwd=str(current_dir),
+                env=env,
                 check=True,
             )
             print("\nFull training completed. Model saved as .pkl in full_training directory.")

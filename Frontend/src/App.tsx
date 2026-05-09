@@ -2,12 +2,21 @@ import { useEffect, useRef, useState } from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
+import { GoogleLogin } from "@react-oauth/google";
+import { toast } from "sonner";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import Navbar from "@/components/landing/Navbar";
 
 import type { PipelineStep } from "@/types/pipeline";
-import { trainModel, improveModel, reRecommendModels, getStatus } from "@/api/client";
+import {
+  trainModel,
+  improveModel,
+  reRecommendModels,
+  getStatus,
+  getAuthMe,
+  signInWithGoogle,
+} from "@/api/client";
 import type { ValidationMetricEntry } from "@/api/client";
 import { PipelineProgress, StepSummaryCard } from "@/components/app";
 import type { StepSummary } from "@/components/app";
@@ -25,6 +34,148 @@ import type { TrainingResult } from "@/steps/TrainingStep";
 import DeploymentStep from "@/steps/DeploymentStep";
 
 const queryClient = new QueryClient();
+
+function RequireAuth({ children }: { children: JSX.Element }) {
+  const [checking, setChecking] = useState(true);
+  const [signedIn, setSignedIn] = useState(false);
+  const [signingIn, setSigningIn] = useState(false);
+  const notifiedRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    getAuthMe()
+      .then((user) => {
+        if (!cancelled) setSignedIn(Boolean(user));
+      })
+      .finally(() => {
+        if (!cancelled) setChecking(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!checking && !signedIn && !notifiedRef.current) {
+      notifiedRef.current = true;
+      toast.error("Google sign in required.");
+    }
+  }, [checking, signedIn]);
+
+  if (checking) {
+    return (
+      <div className="min-h-screen bg-[#0a0a0a] text-white relative overflow-hidden">
+        <div
+          aria-hidden
+          className="absolute top-0 right-0 w-[700px] h-[700px] pointer-events-none"
+          style={{
+            background:
+              "radial-gradient(ellipse at top right, rgba(249,115,22,0.2) 0%, transparent 65%)",
+          }}
+        />
+        <div
+          aria-hidden
+          className="absolute bottom-0 left-0 w-[500px] h-[500px] pointer-events-none"
+          style={{
+            background:
+              "radial-gradient(ellipse at bottom left, rgba(168,85,247,0.12) 0%, transparent 65%)",
+          }}
+        />
+        <div
+          aria-hidden
+          className="absolute inset-0 pointer-events-none"
+          style={{
+            backgroundImage:
+              "radial-gradient(rgba(255,255,255,0.035) 1px, transparent 1px)",
+            backgroundSize: "32px 32px",
+          }}
+        />
+        <div className="relative min-h-screen flex items-center justify-center">
+          <div className="flex items-center gap-2 text-gray-300">
+            <Loader2 size={18} className="animate-spin" />
+            <span className="text-sm">Checking sign-in...</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!signedIn) {
+    return (
+      <div className="min-h-screen bg-[#0a0a0a] text-white relative overflow-hidden">
+        <Navbar />
+        <div
+          aria-hidden
+          className="absolute top-0 right-0 w-[700px] h-[700px] pointer-events-none"
+          style={{
+            background:
+              "radial-gradient(ellipse at top right, rgba(249,115,22,0.2) 0%, transparent 65%)",
+          }}
+        />
+        <div
+          aria-hidden
+          className="absolute bottom-0 left-0 w-[500px] h-[500px] pointer-events-none"
+          style={{
+            background:
+              "radial-gradient(ellipse at bottom left, rgba(168,85,247,0.12) 0%, transparent 65%)",
+          }}
+        />
+        <div
+          aria-hidden
+          className="absolute inset-0 pointer-events-none"
+          style={{
+            backgroundImage:
+              "radial-gradient(rgba(255,255,255,0.035) 1px, transparent 1px)",
+            backgroundSize: "32px 32px",
+          }}
+        />
+        <main className="relative min-h-screen flex items-center justify-center px-4">
+          <div className="w-full max-w-md rounded-2xl border border-white/[0.12] bg-white/[0.04] backdrop-blur-sm p-8 shadow-sm text-center">
+            <h1 className="text-2xl font-semibold text-white">Sign in required</h1>
+            <p className="mt-2 text-sm text-gray-300">Google sign in required.</p>
+            <div className="mt-6 flex justify-center">
+              {signingIn ? (
+                <div className="flex items-center gap-2 text-gray-300">
+                  <Loader2 size={18} className="animate-spin" />
+                  <span className="text-sm">Signing you in...</span>
+                </div>
+              ) : (
+                <GoogleLogin
+                  onSuccess={async (res) => {
+                    if (!res.credential) {
+                      toast.error("Google credential was not returned.");
+                      return;
+                    }
+                    try {
+                      setSigningIn(true);
+                      await signInWithGoogle(res.credential);
+                      setSignedIn(true);
+                      toast.success("Signed in");
+                    } catch (e) {
+                      const msg = e instanceof Error ? e.message : "Sign-in failed";
+                      toast.error(msg);
+                    } finally {
+                      setSigningIn(false);
+                    }
+                  }}
+                  onError={() => toast.error("Google Sign-In error")}
+                  useOneTap={false}
+                  size="large"
+                  text="signin_with"
+                  theme="outline"
+                  shape="pill"
+                />
+              )}
+            </div>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  return children;
+}
 
 // ─── Pipeline view (route: /try-now) ─────────────────────────────────────────
 
@@ -388,7 +539,14 @@ export default function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/" element={<LandingPage />} />
-            <Route path="/try-now" element={<PipelineView />} />
+            <Route
+              path="/try-now"
+              element={
+                <RequireAuth>
+                  <PipelineView />
+                </RequireAuth>
+              }
+            />
             <Route path="*" element={<LandingPage />} />
           </Routes>
         </BrowserRouter>

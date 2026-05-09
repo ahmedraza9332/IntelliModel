@@ -185,6 +185,7 @@ class PreprocessingCodeAgent:
             "dataset_filename": self.dataset_filename,
             "dataset_full_path": dataset_full_path
         })
+        return self._strip_code_fences(raw_code)
         cleaned = self._strip_code_fences(raw_code)
         return self._sanitize_non_printable(cleaned)
 

@@ -4,6 +4,7 @@ Run the generated full-training code for the selected model.
 On execution failure, fix the code with LLM and retry (like run_validation_code_with_llm.py).
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -182,6 +183,9 @@ def main():
             )
 
     print(f"[INFO] Running full training code: {code_path.name} (model: {selected_model})\n")
+    warm_start_path = os.environ.get("INTELLIMODEL_WARM_START_PATH", "").strip()
+    if warm_start_path:
+        print(f"[INFO] Warm-start checkpoint provided: {warm_start_path}")
 
     retries = 0
     while retries < MAX_RETRIES:

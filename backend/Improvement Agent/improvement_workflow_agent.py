@@ -1,9 +1,16 @@
+#usage: python "Improvement Agent/improvement_workflow_agent.py"
 # usage: python "Improvement Agent/improvement_workflow_agent.py"
 """
 AI Agent for Improvement Workflow
 
+This agent orchestrates the improvement workflow:
+1. Load master memory and extract model/validation information
+2. Generate improvement steps using improvement_steps_generator.get_improvement_steps
 Orchestrates the improvement workflow:
 
+The agent maintains its own memory file (improvement_memory.json) and,
+after writing it, updates the master agent memory (master_memory.json)
+so that improvement steps are stored there as well.
   1. load_memory        — Load master_memory.json; ask user which model to improve.
   2. generate_steps     — Generate improvement steps via LLM.
   3. generate_code      — Generate improved validation code (improved_code_gen.py).
@@ -30,12 +37,15 @@ from typing import Dict, Any, Literal, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph  # type: ignore[import]
 
+# Current directory (Improvement Agent folder)
+current_dir = Path(__file__).parent
 current_dir = Path(__file__).resolve().parent
 project_root = current_dir.parent
 
 if str(current_dir) not in sys.path:
     sys.path.insert(0, str(current_dir))
 
+# Reuse prompt/LLM logic from existing improvement_steps_generator
 from improvement_steps_generator import (  # type: ignore[import]
     get_improvement_steps,
     read_file,
@@ -69,6 +79,7 @@ class ImprovementMemory:
     improvement_steps_path: Optional[Path] = None
     improved_validation_code_path: Optional[Path] = None
     improved_validation_metrics: Dict[str, Any] = field(default_factory=dict)
+    # History of filenames created by the workflow
     regeneration_count: int = 0
     user_satisfied: Optional[bool] = None
     proceed_to_deployment: bool = False
@@ -266,6 +277,7 @@ class ImprovementWorkflowAgent:
 
     def _metrics_are_good_enough(self) -> tuple[bool, str]:
         """
+        Initialize the improvement workflow agent.
         Return (True, reason_message) if the baseline metrics are already
         good enough that improvement is unnecessary (≥ 0.97 for quality metrics).
         """
@@ -287,6 +299,11 @@ class ImprovementWorkflowAgent:
                 )
         return False, ""
 
+        Args:
+            model: LLM model name
+            endpoint: LLM endpoint URL
+            output_dir: Directory to save outputs (default: Improvement Agent directory)
+            master_memory_path: Path to master_memory.json (default: project_root/master_memory.json)
     # ======================================================================
     # STEP 2: GENERATE IMPROVEMENT STEPS
     # ======================================================================
@@ -462,8 +479,20 @@ class ImprovementWorkflowAgent:
 
     def run_decision_loop(self) -> str:
         """
+        self.model = model
+        self.endpoint = endpoint
+        self.output_dir = Path(output_dir) if output_dir else current_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         Step 5: Show before/after metrics and ask the user what to do.
 
+        # Resolve master memory path
+        if master_memory_path:
+            master_memory_path = Path(master_memory_path)
+            if not master_memory_path.is_absolute():
+                # Try relative to current working directory first
+                resolved_path = Path.cwd() / master_memory_path
+                if resolved_path.exists():
+                    self.master_memory_path = resolved_path.resolve()
         Returns one of:
           'deploy'          — user is satisfied, proceed to full training
           'regenerate'      — user wants another improvement cycle
@@ -507,6 +536,17 @@ class ImprovementWorkflowAgent:
                     self.memory.user_satisfied = False
                     return "select_model"
                 else:
+                    # Try relative to project root
+                    resolved_path = project_root / master_memory_path
+                    if resolved_path.exists():
+                        self.master_memory_path = resolved_path.resolve()
+                    else:
+                        # Use as-is (may fail later with clearer error)
+                        self.master_memory_path = Path.cwd() / master_memory_path
+            else:
+                self.master_memory_path = master_memory_path.resolve()
+        else:
+            self.master_memory_path = project_root / "master_memory.json"
                     print("Please enter a, b, or c.")
             except (EOFError, KeyboardInterrupt):
                 print("\nUsing default: proceed to deployment.")
@@ -514,10 +554,15 @@ class ImprovementWorkflowAgent:
                 self.memory.proceed_to_deployment = True
                 return "deploy"
 
+        # Initialize memory
+        self.memory = ImprovementMemory()
+        self.memory.master_memory_path = self.master_memory_path
     # ======================================================================
     # WORKFLOW GRAPH
     # ======================================================================
 
+        # Conversation / step history (for transparency)
+        self.conversation_history: list[Dict[str, str]] = []
     def _build_workflow_graph(self):
         class WorkflowState(TypedDict, total=False):
             master_memory: Dict[str, Any]
@@ -529,8 +574,12 @@ class ImprovementWorkflowAgent:
             error: str
             memory_snapshot: Dict[str, Any]
 
+        # Default improvement steps path
+        self.memory.improvement_steps_path = self.output_dir / "improvement_steps.txt"
         state_graph = StateGraph(WorkflowState)
 
+        # Memory file path (named after agent, not dataset)
+        self.memory_file_path = self.output_dir / "improvement_memory.json"
         state_graph.add_node("load_memory", self._graph_load_memory)
         state_graph.add_node("generate_improvements", self._graph_generate_improvements)
         state_graph.add_node("generate_improved_code", self._graph_generate_improved_code)
@@ -538,6 +587,8 @@ class ImprovementWorkflowAgent:
         state_graph.add_node("decision_loop", self._graph_decision_loop)
         state_graph.add_node("persist_memory", self._graph_finalize_memory)
 
+        # LangGraph workflow
+        self.workflow = self._build_workflow_graph()
         state_graph.set_entry_point("load_memory")
 
         state_graph.add_conditional_edges(
@@ -695,9 +746,13 @@ class ImprovementWorkflowAgent:
         return {"memory_snapshot": snapshot, "status": "success"}
 
     # ======================================================================
+    # STEP 1: LOAD MASTER MEMORY
     # PUBLIC API
     # ======================================================================
 
+    def load_master_memory(self) -> Dict[str, Any]:
+        """
+        Step 1: Load master memory and extract required information.
     def get_memory(self) -> Dict[str, Any]:
         return {
             "master_memory_path": str(self.memory.master_memory_path) if self.memory.master_memory_path else None,
@@ -720,27 +775,56 @@ class ImprovementWorkflowAgent:
             "dataset_folder": str(self.output_dir) if self.output_dir else None,
         }
 
+        Returns:
+            Master memory dictionary
+        """
+        print("\n" + "=" * 60)
+        print("IMPROVEMENT WORKFLOW - STEP 1: Loading Master Memory")
+        print("=" * 60)
     def save_memory(self, path: Optional[Path] = None) -> None:
         if path is None:
             path = self.memory_file_path
         if path is None:
             return
 
+        if not self.master_memory_path or not self.master_memory_path.exists():
+            raise FileNotFoundError(
+                f"Master memory file not found: {self.master_memory_path}"
+            )
         memory_dict = self.get_memory()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as f:
             json.dump(memory_dict, f, indent=2)
 
+        print(f"Loading master memory from: {self.master_memory_path}")
+        try:
+            with self.master_memory_path.open("r", encoding="utf-8") as f:
+                master_memory = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"master_memory.json is corrupted (invalid JSON): {self.master_memory_path}\n"
+                f"Error: {exc}\nPlease delete or repair the file and re-run the workflow."
+            ) from exc
         self.memory_file_path = path
         print(f"[INFO] Improvement memory saved to: {path}")
 
+        # Extract dataset context
+        self.memory.dataset_context = master_memory.get("context_of_dataset")
     def load_memory_from_file(self, path: Path) -> None:
         if not path.exists():
             raise FileNotFoundError(f"Improvement memory file not found: {path}")
 
+        # Extract preprocessing report path
+        preprocessing = master_memory.get("preprocessing", {})
+        report_path_str = preprocessing.get("report_path")
+        if report_path_str:
+            self.memory.dataset_report_path = Path(report_path_str)
         with path.open("r", encoding="utf-8") as f:
             d = json.load(f)
 
+        # Extract model selection and validation metrics from LLM orchestrator memory
+        llm_orch = master_memory.get("llm_orchestrator", {})
+        orch_mem = llm_orch.get("orchestrator_memory", {})
         if d.get("master_memory_path"):
             self.memory.master_memory_path = Path(d["master_memory_path"])
         self.memory.dataset_name = d.get("dataset_name")
@@ -752,6 +836,9 @@ class ImprovementWorkflowAgent:
         self.memory.user_satisfied = d.get("user_satisfied")
         self.memory.proceed_to_deployment = d.get("proceed_to_deployment", False)
 
+        # Get models that were selected for validation testing
+        selected_models_for_validation = orch_mem.get("selected_models_for_validation", [])
+        validation_metrics_full = orch_mem.get("validation_metrics", {})
         for attr, key in [
             ("validation_code_path", "validation_code_path"),
             ("dataset_report_path", "dataset_report_path"),
@@ -762,25 +849,779 @@ class ImprovementWorkflowAgent:
             if val:
                 setattr(self.memory, attr, Path(val))
 
+        if not selected_models_for_validation:
+            raise ValueError("No models were selected for validation testing. Cannot perform improvement.")
         if self.memory.improvement_steps_path and self.memory.improvement_steps_path.exists():
             self.memory.improvement_steps = self.memory.improvement_steps_path.read_text(encoding="utf-8")
 
+        # Ask user which model to improve
+        print("\nAvailable models for improvement:")
+        for idx, model_name in enumerate(selected_models_for_validation, 1):
+            metrics = validation_metrics_full.get(model_name, {}).get("metrics", {})
+            print(f"  {idx}. {model_name}")
+            if metrics:
+                print(f"     Metrics: {metrics}")
         self.memory.improved_validation_metrics = d.get("improved_validation_metrics", {})
         self.memory.file_history = d.get("file_history", {})
 
+        while True:
+            try:
+                choice = input(f"\nSelect model to improve (1-{len(selected_models_for_validation)}): ").strip()
+                choice_idx = int(choice) - 1
+                if 0 <= choice_idx < len(selected_models_for_validation):
+                    selected_model = selected_models_for_validation[choice_idx]
+                    break
+                else:
+                    print(f"Please enter a number between 1 and {len(selected_models_for_validation)}")
+            except ValueError:
+                print("Please enter a valid number")
+            except (EOFError, KeyboardInterrupt):
+                raise ValueError("User cancelled model selection")
         # Re-init output dir
         if self.memory.dataset_name:
             self._init_output_dir(self.memory.dataset_name)
 
+        self.memory.model_name = selected_model
 
+        # Extract validation metrics and code path for selected model
+        self.memory.validation_metrics = {}
+        self.memory.validation_code_path = None
 def main() -> None:
     import argparse
 
+        if selected_model in validation_metrics_full:
+            info = validation_metrics_full[selected_model]
+            self.memory.validation_metrics = info.get("metrics", {}) or {}
+            code_path_str = info.get("code_path")
+            if code_path_str:
+                self.memory.validation_code_path = Path(code_path_str)
     parser = argparse.ArgumentParser(description="AI Agent for Improvement Workflow")
     parser.add_argument("--master-memory", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
     parser.add_argument("--endpoint", type=str, default=DEFAULT_ENDPOINT)
+    args = parser.parse_args()
+
+        # Track files in local file_history
+        try:
+            self.memory.file_history["master_memory"] = str(
+                self.master_memory_path.resolve()
+            )
+            if self.memory.dataset_report_path:
+                self.memory.file_history["dataset_report"] = str(
+                    self.memory.dataset_report_path.resolve()
+                )
+            if self.memory.validation_code_path:
+                self.memory.file_history["validation_code"] = str(
+                    self.memory.validation_code_path.resolve()
+                )
+        except Exception:
+            pass
+    try:
+        agent = ImprovementWorkflowAgent(
+            model=args.model,
+            endpoint=args.endpoint,
+            output_dir=args.output_dir,
+            master_memory_path=args.master_memory,
+        )
+
+        # Basic validation
+        if not self.memory.model_name:
+            raise ValueError("Model selection failed")
+        if not self.memory.validation_metrics:
+            raise ValueError(f"Validation metrics for {selected_model} not found in master memory")
+        if not self.memory.dataset_context:
+            raise ValueError("context_of_dataset not found in master memory")
+        if not self.memory.dataset_report_path:
+            raise ValueError("preprocessing.report_path not found in master memory")
+        if not self.memory.validation_code_path:
+            raise ValueError(f"Validation code path for {selected_model} not found in master memory")
+        initial_state = {"status": "pending"}
+        result_state = agent.workflow.invoke(initial_state)
+
+        print(f"\nSelected model for improvement: {self.memory.model_name}")
+        print(f"Validation code: {self.memory.validation_code_path}")
+        print(f"Dataset report: {self.memory.dataset_report_path}")
+        print(f"Context: {self.memory.dataset_context}")
+        if result_state.get("status") == "success":
+            print("\n" + "=" * 60)
+            print("IMPROVEMENT WORKFLOW COMPLETED")
+            print("=" * 60)
+            mem = agent.get_memory()
+            print(f"  Model: {mem.get('model_name')}")
+            print(f"  Dataset folder: {mem.get('dataset_folder')}")
+            print(f"  Proceed to deployment: {mem.get('proceed_to_deployment')}")
+            print(f"  Improvement runs recorded: {mem.get('regeneration_count', 0)}")
+            sys.exit(0)
+
+        # Save intermediate memory
+        self.save_memory()
+        error = result_state.get("error", "Unknown error")
+        print(f"\n[ERROR] Improvement workflow failed: {error}")
+        sys.exit(1)
+
+        return master_memory
+    except FileNotFoundError as exc:
+        print(f"\n[ERROR] Required file not found: {exc}")
+        sys.exit(1)
+    except RuntimeError as exc:
+        print(f"\n[ERROR] {exc}")
+        sys.exit(1)
+    except Exception as exc:
+        print(f"\n[ERROR] Unexpected error: {type(exc).__name__}: {exc}")
+        sys.exit(1)
+
+    # ======================================================================
+    # STEP 2: GENERATE IMPROVEMENT STEPS
+    # ======================================================================
+
+    def generate_improvement_steps(self) -> str:
+        """
+        Step 2: Generate improvement steps using the LLM.
+
+        Returns:
+            Improvement steps as string
+        """
+        print("\n" + "=" * 60)
+        print("IMPROVEMENT WORKFLOW - STEP 2: Generating Improvement Steps")
+        print("=" * 60)
+
+        if not self.memory.model_name:
+            raise ValueError("Model name not set in memory. Run load_master_memory() first.")
+        if not self.memory.validation_metrics:
+            raise ValueError("Validation metrics not set in memory. Run load_master_memory() first.")
+        if not self.memory.dataset_context:
+            raise ValueError("Dataset context not set in memory. Run load_master_memory() first.")
+        if not self.memory.dataset_report_path or not self.memory.dataset_report_path.exists():
+            raise FileNotFoundError(
+                f"Dataset report file not found: {self.memory.dataset_report_path}"
+            )
+        if not self.memory.validation_code_path or not self.memory.validation_code_path.exists():
+            raise FileNotFoundError(
+                f"Validation code file not found: {self.memory.validation_code_path}"
+            )
+
+        # Read validation code and dataset report
+        validation_code = read_file(str(self.memory.validation_code_path))
+        dataset_report = read_file(str(self.memory.dataset_report_path))
+
+        if validation_code is None or dataset_report is None:
+            raise RuntimeError("Failed to read validation code or dataset report.")
+
+        print(
+            f"\n[INFO] Requesting improvement steps for model: {self.memory.model_name}\n"
+        )
+
+        steps_text = get_improvement_steps(
+            model_name=self.memory.model_name,
+            validation_metrics=self.memory.validation_metrics,
+            validation_code=validation_code,
+            dataset_report=dataset_report,
+            dataset_context=self.memory.dataset_context,
+            model=self.model,
+            endpoint=self.endpoint,
+        )
+
+        self.memory.improvement_steps = steps_text
+
+        # Save improvement steps to file
+        if not self.memory.improvement_steps_path:
+            self.memory.improvement_steps_path = self.output_dir / "improvement_steps.txt"
+        self.memory.improvement_steps_path.parent.mkdir(parents=True, exist_ok=True)
+        self.memory.improvement_steps_path.write_text(steps_text, encoding="utf-8")
+
+        try:
+            self.memory.file_history["improvement_steps"] = str(
+                self.memory.improvement_steps_path.resolve()
+            )
+        except Exception:
+            pass
+
+        print("\n=== IMPROVEMENT STEPS ===")
+        print(steps_text)
+        print("=========================\n")
+
+        # Save memory after generating steps
+        self.save_memory()
+
+        return steps_text
+
+    # ======================================================================
+    # WORKFLOW GRAPH & MEMORY PERSISTENCE
+    # ======================================================================
+
+    def run_improved_code_generation(self) -> Optional[Path]:
+        """
+        Run improved_code_gen.py to generate improved validation code.
+
+        Returns:
+            Path to improved validation code file if generated, else None.
+        """
+        import subprocess
+
+        print("\n" + "=" * 60)
+        print("IMPROVEMENT WORKFLOW - STEP 3: Generating Improved Validation Code")
+        print("=" * 60)
+
+        # improved_code_gen.py expects master_memory.json in the working directory
+        improved_script = current_dir / "improved_code_gen.py"
+        if not improved_script.exists():
+            print(f"[WARN] Improved code generator not found: {improved_script}. Skipping.")
+            return None
+
+        # Run from project root so MASTER_MEMORY path ("master_memory.json") resolves correctly
+        try:
+            subprocess.run(
+                [sys.executable, str(improved_script)],
+                cwd=str(project_root),
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                "Improved code generator failed to run."
+            ) from exc
+
+        # Compute expected improved validation code path
+        if not self.memory.model_name:
+            return None
+
+        improved_dir = current_dir / "improved_training"
+        improved_file = improved_dir / f"{self.memory.model_name}_improved_validation.py"
+
+        if improved_file.exists():
+            self.memory.improved_validation_code_path = improved_file.resolve()
+            try:
+                self.memory.file_history["improved_validation_code"] = str(
+                    self.memory.improved_validation_code_path
+                )
+            except Exception:
+                pass
+            print(f"[INFO] Improved validation code found at: {improved_file}")
+            return self.memory.improved_validation_code_path
+
+        print(f"[WARN] Expected improved validation code not found at: {improved_file}")
+        return None
+
+    def run_improved_code_runner(self) -> Optional[Dict[str, Any]]:
+        """
+        Run improved_code_runner.py to execute improved validation code and capture metrics.
+
+        Returns:
+            Dictionary with improved validation metrics if successful, else None.
+        """
+        import subprocess
+        import re
+        import sys  # ensure sys is available even in nested/fallback executions
+
+        print("\n" + "=" * 60)
+        print("IMPROVEMENT WORKFLOW - STEP 3: Running Improved Validation Code")
+        print("=" * 60)
+
+        # Ensure improvement memory is saved before running
+        self.save_memory()
+
+        improved_runner_script = current_dir / "improved_code_runner.py"
+        if not improved_runner_script.exists():
+            print(f"[WARN] Improved code runner not found: {improved_runner_script}. Skipping.")
+            return None
+
+        # Run from project root
+        try:
+            result = subprocess.run(
+                [sys.executable, str(improved_runner_script)],
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+                check=False,  # Don't raise on error, we'll check output
+            )
+            
+            stdout = result.stdout
+            stderr = result.stderr
+            
+            print(f"[INFO] Improved code runner executed.")
+            if stdout:
+                print(stdout)
+            if stderr:
+                print(f"[WARN] Stderr: {stderr}")
+
+            # Parse metrics from output
+            improved_metrics = {}
+            
+            # Look for metrics in stdout (common patterns: MAE, MSE, R2, etc.)
+            # Broaden parsing to handle '=', scientific notation, and +/- values.
+            num_pattern = r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)'
+            mae_match = re.search(rf'MAE\s*[:=]\s*{num_pattern}', stdout, re.IGNORECASE)
+            mse_match = re.search(rf'MSE\s*[:=]\s*{num_pattern}', stdout, re.IGNORECASE)
+            r2_match = re.search(rf'R2[^:=]*[:=]\s*{num_pattern}', stdout, re.IGNORECASE)
+            # Also accept "Mean Cross-validated R2 score" as an R2-like metric
+            if not r2_match:
+                r2_match = re.search(rf'Mean\s+Cross-validated\s+R2\s+score\s*[:=]\s*{num_pattern}', stdout, re.IGNORECASE)
+            rmse_match = re.search(rf'RMSE\s*[:=]\s*{num_pattern}', stdout, re.IGNORECASE)
+            
+            if mae_match:
+                improved_metrics["MAE"] = float(mae_match.group(1))
+            if mse_match:
+                improved_metrics["MSE"] = float(mse_match.group(1))
+            if r2_match:
+                improved_metrics["R2"] = float(r2_match.group(1))
+            if rmse_match:
+                improved_metrics["RMSE"] = float(rmse_match.group(1))
+            
+            # Also try to parse from the validation_code_updated.py output if it was executed
+            # Check if validation_code_updated.py exists and was recently created
+            updated_code_path = project_root / "validation_code_updated.py"
+            if updated_code_path.exists():
+                # Try to execute it and capture metrics
+                try:
+                    exec_result = subprocess.run(
+                        [sys.executable, str(updated_code_path)],
+                        cwd=str(project_root),
+                        capture_output=True,
+                        text=True,
+                        timeout=300,  # 5 minute timeout
+                    )
+                    
+                    exec_stdout = exec_result.stdout
+                    if exec_stdout:
+                        # Parse metrics from execution output
+                        exec_mae = re.search(r'MAE:\s*([\d.]+)', exec_stdout, re.IGNORECASE)
+                        exec_mse = re.search(r'MSE:\s*([\d.]+)', exec_stdout, re.IGNORECASE)
+                        exec_r2 = re.search(r'R2[^:]*:\s*([\d.-]+)', exec_stdout, re.IGNORECASE)
+                        exec_rmse = re.search(r'RMSE:\s*([\d.]+)', exec_stdout, re.IGNORECASE)
+                        
+                        if exec_mae:
+                            improved_metrics["MAE"] = float(exec_mae.group(1))
+                        if exec_mse:
+                            improved_metrics["MSE"] = float(exec_mse.group(1))
+                        if exec_r2:
+                            improved_metrics["R2"] = float(exec_r2.group(1))
+                        if exec_rmse:
+                            improved_metrics["RMSE"] = float(exec_rmse.group(1))
+                except Exception as exc:
+                    print(f"[WARN] Could not execute updated validation code: {exc}")
+            
+            if improved_metrics:
+                # Store improved metrics in memory
+                self.memory.improved_validation_metrics = improved_metrics
+                print(f"[INFO] Captured improved validation metrics: {improved_metrics}")
+                return improved_metrics
+
+            # Fallback: try executing the improved validation code file directly
+            code_path = (
+                self.memory.improved_validation_code_path
+                or self.memory.validation_code_path
+            )
+            if code_path and Path(code_path).exists():
+                try:
+                    direct_result = subprocess.run(
+                        [sys.executable, str(code_path)],
+                        cwd=str(project_root),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    direct_stdout = direct_result.stdout
+                    if direct_stdout:
+                        mae_match = re.search(rf'MAE\s*[:=]\s*{num_pattern}', direct_stdout, re.IGNORECASE)
+                        mse_match = re.search(rf'MSE\s*[:=]\s*{num_pattern}', direct_stdout, re.IGNORECASE)
+                        r2_match = re.search(rf'R2[^:=]*[:=]\s*{num_pattern}', direct_stdout, re.IGNORECASE)
+                        if not r2_match:
+                            r2_match = re.search(rf'Mean\s+Cross-validated\s+R2\s+score\s*[:=]\s*{num_pattern}', direct_stdout, re.IGNORECASE)
+                        rmse_match = re.search(rf'RMSE\s*[:=]\s*{num_pattern}', direct_stdout, re.IGNORECASE)
+
+                        if mae_match:
+                            improved_metrics["MAE"] = float(mae_match.group(1))
+                        if mse_match:
+                            improved_metrics["MSE"] = float(mse_match.group(1))
+                        if r2_match:
+                            improved_metrics["R2"] = float(r2_match.group(1))
+                        if rmse_match:
+                            improved_metrics["RMSE"] = float(rmse_match.group(1))
+
+                except Exception as exc:
+                    print(f"[WARN] Direct execution of validation code failed: {exc}")
+
+            if improved_metrics:
+                self.memory.improved_validation_metrics = improved_metrics
+                print(f"[INFO] Captured improved validation metrics (fallback): {improved_metrics}")
+                return improved_metrics
+
+            print("[WARN] No metrics found in output.")
+            return None
+                
+        except subprocess.TimeoutExpired:
+            print("[WARN] Improved code runner timed out.")
+            return None
+        except Exception as exc:
+            print(f"[WARN] Improved code runner failed: {exc}")
+            # Attempt direct execution fallback even on failure
+            try:
+                code_path = self.memory.improved_validation_code_path or self.memory.validation_code_path
+                if code_path and Path(code_path).exists():
+                    direct_result = subprocess.run(
+                        [sys.executable, str(code_path)],
+                        cwd=str(project_root),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    direct_stdout = direct_result.stdout
+                    improved_metrics = {}
+                    if direct_stdout:
+                        num_pattern = r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)'
+                        mae_match = re.search(rf'MAE\s*[:=]\s*{num_pattern}', direct_stdout, re.IGNORECASE)
+                        mse_match = re.search(rf'MSE\s*[:=]\s*{num_pattern}', direct_stdout, re.IGNORECASE)
+                        r2_match = re.search(rf'R2[^:=]*[:=]\s*{num_pattern}', direct_stdout, re.IGNORECASE)
+                        if not r2_match:
+                            r2_match = re.search(rf'Mean\s+Cross-validated\s+R2\s+score\s*[:=]\s*{num_pattern}', direct_stdout, re.IGNORECASE)
+                        rmse_match = re.search(rf'RMSE\s*[:=]\s*{num_pattern}', direct_stdout, re.IGNORECASE)
+                        if mae_match:
+                            improved_metrics["MAE"] = float(mae_match.group(1))
+                        if mse_match:
+                            improved_metrics["MSE"] = float(mse_match.group(1))
+                        if r2_match:
+                            improved_metrics["R2"] = float(r2_match.group(1))
+                        if rmse_match:
+                            improved_metrics["RMSE"] = float(rmse_match.group(1))
+                    if improved_metrics:
+                        self.memory.improved_validation_metrics = improved_metrics
+                        print(f"[INFO] Captured improved validation metrics (direct fallback after failure): {improved_metrics}")
+                        return improved_metrics
+            except Exception as fallback_exc:
+                print(f"[WARN] Direct fallback execution also failed: {fallback_exc}")
+            return None
+
+    def _build_workflow_graph(self):
+        """
+        Build a LangGraph state graph that coordinates the improvement workflow.
+        """
+
+        class WorkflowState(TypedDict, total=False):
+            master_memory: Dict[str, Any]
+            improvement_steps: str
+            improved_validation_code_path: Optional[str]
+            improved_validation_metrics: Optional[Dict[str, Any]]
+            status: Literal["pending", "ok", "error", "success"]
+            error: str
+            memory_snapshot: Dict[str, Any]
+
+        state_graph = StateGraph(WorkflowState)
+        state_graph.add_node("load_memory", self._graph_load_memory)
+        state_graph.add_node("generate_improvements", self._graph_generate_improvements)
+        state_graph.add_node("run_improved_code", self._graph_run_improved_code)
+        state_graph.add_node("persist_memory", self._graph_finalize_memory)
+
+        state_graph.set_entry_point("load_memory")
+        state_graph.add_conditional_edges(
+            "load_memory",
+            self._status_router,
+            {"error": END, "ok": "generate_improvements"},
+        )
+        state_graph.add_conditional_edges(
+            "generate_improvements",
+            self._status_router,
+            {"error": END, "ok": "run_improved_code"},
+        )
+        state_graph.add_conditional_edges(
+            "run_improved_code",
+            self._status_router,
+            {"error": END, "ok": "persist_memory"},
+        )
+        state_graph.add_edge("persist_memory", END)
+
+        return state_graph.compile()
+
+    @staticmethod
+    def _status_router(state: Dict[str, Any]) -> str:
+        """
+        Determine next edge based on state.
+        """
+        return "error" if state.get("status") == "error" else "ok"
+
+    def _add_memory_entry(self, user_text: str, ai_text: str) -> None:
+        """
+        Store a conversational trace for transparency/debugging.
+        """
+        self.conversation_history.append({"input": user_text, "output": ai_text})
+
+    # Graph nodes
+
+    def _graph_load_memory(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        LangGraph node: load master memory.
+        """
+        try:
+            master_memory = self.load_master_memory()
+            summary = (
+                f"Master memory loaded. Selected model: {self.memory.model_name}. "
+                f"Validation metrics keys: {list(self.memory.validation_metrics.keys())}"
+            )
+            self._add_memory_entry("Load master memory", summary)
+            return {
+                "master_memory": master_memory,
+                "status": "ok",
+                "error": "",
+            }
+        except Exception as exc:
+            error_message = f"Memory loading failed: {exc}"
+            self._add_memory_entry("Load master memory", error_message)
+            return {"status": "error", "error": error_message}
+
+    def _graph_generate_improvements(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        LangGraph node: generate improvement steps.
+        """
+        try:
+            steps_text = self.generate_improvement_steps()
+            length = len(steps_text) if steps_text else 0
+            self._add_memory_entry(
+                "Generate improvement steps",
+                f"Improvement steps generated with {length} characters.",
+            )
+            return {
+                "improvement_steps": steps_text,
+                "status": "ok",
+                "error": "",
+            }
+        except Exception as exc:
+            error_message = f"Improvement step generation failed: {exc}"
+            self._add_memory_entry("Generate improvement steps", error_message)
+            return {"status": "error", "error": error_message}
+
+    def _graph_generate_improved_code(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        LangGraph node: generate improved validation code using improved_code_gen.py.
+        """
+        try:
+            path = self.run_improved_code_generation()
+            path_str = str(path) if path else ""
+            self._add_memory_entry(
+                "Generate improved validation code",
+                f"Improved validation code path: {path_str or 'none'}",
+            )
+            return {
+                "improved_validation_code_path": path_str,
+                "status": "ok",
+                "error": "",
+            }
+        except Exception as exc:
+            error_message = f"Improved validation code generation failed: {exc}"
+            self._add_memory_entry("Generate improved validation code", error_message)
+            return {"status": "error", "error": error_message}
+
+    def _graph_run_improved_code(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        LangGraph node: run improved validation code using improved_code_runner.py.
+        """
+        try:
+            metrics = self.run_improved_code_runner()
+            metrics_str = str(metrics) if metrics else "none"
+            self._add_memory_entry(
+                "Run improved validation code",
+                f"Improved validation metrics: {metrics_str}",
+            )
+            # Save memory after capturing metrics to ensure they're stored
+            if metrics:
+                self.save_memory()
+            return {
+                "improved_validation_metrics": metrics,
+                "status": "ok",
+                "error": "",
+            }
+        except Exception as exc:
+            error_message = f"Improved code runner failed: {exc}"
+            self._add_memory_entry("Run improved validation code", error_message)
+            return {"status": "error", "error": error_message}
+
+    def _graph_finalize_memory(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Final LangGraph node: capture memory snapshot, save to file,
+        and copy improvement memory to master_memory.json.
+        """
+        snapshot = self.get_memory()
+
+        # Save improvement agent memory
+        self.save_memory()
+
+        # Copy improvement memory to master_memory.json
+        if self.master_memory_path and self.master_memory_path.exists():
+            try:
+                with self.master_memory_path.open("r", encoding="utf-8") as f:
+                    try:
+                        master_memory = json.load(f)
+                    except json.JSONDecodeError as exc:
+                        print(f"[WARN] master_memory.json is corrupted, skipping copy: {exc}")
+                        master_memory = None
+
+                # Copy entire improvement memory to master_memory.json
+                improvement_memory_dict = self.get_memory()
+                if master_memory is not None:
+                    master_memory["improvement"] = {
+                        "optimization_report": {},
+                        "optimized_code_length": 0,
+                        "optimization_report_path": None,
+                        "optimized_code_path": None,
+                        "improvement_steps": improvement_memory_dict.get("improvement_steps"),
+                        "improvement_steps_path": improvement_memory_dict.get("improvement_steps_path"),
+                        "model_name": improvement_memory_dict.get("model_name"),
+                        "validation_metrics": improvement_memory_dict.get("validation_metrics"),
+                        "improved_validation_metrics": improvement_memory_dict.get("improved_validation_metrics", {}),
+                    }
+
+                    with self.master_memory_path.open("w", encoding="utf-8") as f:
+                        json.dump(master_memory, f, indent=2)
+
+                    self._add_memory_entry(
+                        "Persist improvement to master",
+                        "Improvement memory copied to master_memory.json.",
+                    )
+            except Exception as exc:
+                self._add_memory_entry(
+                    "Persist improvement to master",
+                    f"Failed to update master_memory.json: {exc}",
+                )
+
+        return {
+            "memory_snapshot": snapshot,
+            "status": "success",
+        }
+
+    # ======================================================================
+    # PUBLIC API
+    # ======================================================================
+
+    def get_memory(self) -> Dict[str, Any]:
+        """
+        Get the current improvement workflow memory.
+        """
+        base_memory = {
+            "master_memory_path": str(self.memory.master_memory_path)
+            if self.memory.master_memory_path
+            else None,
+            "model_name": self.memory.model_name,
+            "validation_metrics": self.memory.validation_metrics,
+            "dataset_context": self.memory.dataset_context,
+            "validation_code_path": str(self.memory.validation_code_path)
+            if self.memory.validation_code_path
+            else None,
+            "dataset_report_path": str(self.memory.dataset_report_path)
+            if self.memory.dataset_report_path
+            else None,
+            "improvement_steps": self.memory.improvement_steps,
+            "improvement_steps_path": str(self.memory.improvement_steps_path)
+            if self.memory.improvement_steps_path
+            else None,
+            "improved_validation_code_path": str(self.memory.improved_validation_code_path)
+            if self.memory.improved_validation_code_path
+            else None,
+            "improved_validation_metrics": self.memory.improved_validation_metrics,
+            "file_history": self.memory.file_history,
+        }
+        base_memory["conversation_history"] = self.conversation_history
+        return base_memory
+
+    def save_memory(self, path: Optional[Path] = None) -> None:
+        """
+        Save improvement workflow memory to a JSON file.
+        """
+        if path is None:
+            path = self.memory_file_path
+
+        memory_dict = self.get_memory()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(memory_dict, f, indent=2)
+
+        self.memory_file_path = path
+        try:
+            self.memory.file_history["improvement_memory"] = str(path.resolve())
+        except Exception:
+            pass
+
+        print(f"Improvement workflow memory saved to: {path}")
+
+    def load_memory(self, path: Path) -> None:
+        """
+        Load improvement workflow memory from a JSON file.
+        """
+        if not path.exists():
+            raise FileNotFoundError(f"Improvement memory file not found: {path}")
+
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                memory_dict = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Improvement memory file is corrupted (invalid JSON): {path}\n"
+                f"Error: {exc}\nPlease delete or repair the file and re-run the workflow."
+            ) from exc
+
+        if memory_dict.get("master_memory_path"):
+            self.memory.master_memory_path = Path(memory_dict["master_memory_path"])
+        self.memory.model_name = memory_dict.get("model_name")
+        self.memory.validation_metrics = memory_dict.get("validation_metrics", {})
+        self.memory.dataset_context = memory_dict.get("dataset_context")
+
+        if memory_dict.get("validation_code_path"):
+            self.memory.validation_code_path = Path(memory_dict["validation_code_path"])
+        if memory_dict.get("dataset_report_path"):
+            self.memory.dataset_report_path = Path(memory_dict["dataset_report_path"])
+        if memory_dict.get("improvement_steps_path"):
+            self.memory.improvement_steps_path = Path(
+                memory_dict["improvement_steps_path"]
+            )
+            if self.memory.improvement_steps_path.exists():
+                self.memory.improvement_steps = (
+                    self.memory.improvement_steps_path.read_text(encoding="utf-8")
+                )
+        if memory_dict.get("improved_validation_code_path"):
+            self.memory.improved_validation_code_path = Path(
+                memory_dict["improved_validation_code_path"]
+            )
+        if memory_dict.get("improved_validation_metrics"):
+            self.memory.improved_validation_metrics = memory_dict["improved_validation_metrics"]
+
+        if memory_dict.get("file_history"):
+            try:
+                self.memory.file_history = dict(memory_dict["file_history"])
+            except Exception:
+                pass
+
+        print(f"Improvement workflow memory loaded from: {path}")
+
+
+def main() -> None:
+    """Main entry point for command-line usage."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="AI Agent for Improvement Workflow"
+    )
+    parser.add_argument(
+        "--master-memory",
+        type=Path,
+        default=None,
+        help="Path to master_memory.json (default: project_root/master_memory.json)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory to save outputs (default: Improvement Agent directory)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL,
+        help=f"LLM model name (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--endpoint",
+        type=str,
+        default=DEFAULT_ENDPOINT,
+        help=f"LLM endpoint URL (default: {DEFAULT_ENDPOINT})",
+    )
+
     args = parser.parse_args()
 
     try:
@@ -795,28 +1636,34 @@ def main() -> None:
         result_state = agent.workflow.invoke(initial_state)
 
         if result_state.get("status") == "success":
+            agent.save_memory()
             print("\n" + "=" * 60)
-            print("IMPROVEMENT WORKFLOW COMPLETED")
+            print("IMPROVEMENT WORKFLOW COMPLETED SUCCESSFULLY")
             print("=" * 60)
-            mem = agent.get_memory()
-            print(f"  Model: {mem.get('model_name')}")
-            print(f"  Dataset folder: {mem.get('dataset_folder')}")
-            print(f"  Proceed to deployment: {mem.get('proceed_to_deployment')}")
-            print(f"  Improvement runs recorded: {mem.get('regeneration_count', 0)}")
+            print(f"\nSummary:")
+            print(f"  - Model: {agent.memory.model_name}")
+            print(f"  - Improvement steps file: {agent.memory.improvement_steps_path}")
+            print(f"  - Memory saved: {agent.memory_file_path}")
             sys.exit(0)
 
-        error = result_state.get("error", "Unknown error")
-        print(f"\n[ERROR] Improvement workflow failed: {error}")
+        error_message = result_state.get("error", "Unknown error")
+        print(f"\n[ERROR] Improvement workflow failed: {error_message}")
         sys.exit(1)
 
     except FileNotFoundError as exc:
         print(f"\n[ERROR] Required file not found: {exc}")
+        print("Make sure the preprocessing and validation steps have completed successfully.")
         sys.exit(1)
     except RuntimeError as exc:
         print(f"\n[ERROR] {exc}")
         sys.exit(1)
+    except ConnectionError as exc:
+        print(f"\n[ERROR] Could not connect to LLM endpoint: {exc}")
+        print("Make sure the Ollama server is running (e.g. 'ollama serve') and try again.")
+        sys.exit(1)
     except Exception as exc:
-        print(f"\n[ERROR] Unexpected error: {type(exc).__name__}: {exc}")
+        print(f"\n[ERROR] Unexpected error in improvement workflow: {type(exc).__name__}: {exc}")
+        print("Check the logs above for details. If the problem persists, inspect improvement_memory.json.")
         sys.exit(1)
 
 
