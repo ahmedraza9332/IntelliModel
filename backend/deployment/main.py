@@ -387,18 +387,24 @@ def _patch_preprocessing_code(
        Uses a DOTALL regex so multi-line calls (with encoding=, dtype= kwargs
        spread over several lines) are matched correctly.
 
-    2. Inject a snippet right after the read_csv replacement to:
-       a. Preserve the sentinel column through the entire script so we can
-          locate the user's row in the output even after drop_duplicates().
-       b. Patch drop_duplicates() to exclude the sentinel column from the
-          duplicate-detection comparison, so the user's row is NEVER removed
-          even if every feature value happens to match a training row exactly.
+    2. Inject sentinel tracking:
+       a. Prepend an initialisation block at the very top of the script so that
+          _inference_sentinel_vals is always defined (even if step 2b is skipped).
+       b. Capture the sentinel column values AFTER the complete try/except block
+          that loads the CSV — NOT inside the try body, which would break the
+          compound-statement grammar and produce a SyntaxError at `except`.
+       c. Patch drop_duplicates() to exclude the sentinel column from duplicate
+          detection so the user's row is never silently removed.
 
-    3. Neutralise uniqueness/shape assertions that would crash when the user
-       row shares a value already present in training data.
+    3. Neutralise uniqueness/shape assertions that would crash at inference time.
 
-    4. Inject code at the END of the script to carry the sentinel column
-       through into processed_output.csv.
+    4. Inject code immediately before the LINE that calls .to_csv() to ensure the
+       sentinel column is present in the saved output.
+
+       CRITICAL: the injection must target the START OF THE LINE, not the position
+       of the dot.  Inserting between "df" and ".to_csv(...)" splits the expression
+       into two separate statements — "df" (valid but useless) and ".to_csv(...)"
+       (invalid on its own) — which produces "SyntaxError: invalid syntax".
     """
     import re
 
@@ -412,23 +418,68 @@ def _patch_preprocessing_code(
         count=1,
     )
 
-    # ── 2a. Inject sentinel preservation right after the first read_csv line ─
-    #    We find the replacement we just made and inject after the line it's on.
-    SENTINEL_PRESERVE = f"""
-# --- IntelliModel inference: preserve sentinel column ---
-_inference_sentinel_col = {sentinel_col!r}
-_inference_sentinel_vals = df[_inference_sentinel_col].copy() if _inference_sentinel_col in df.columns else None
-# --------------------------------------------------------
-"""
-    # Insert after the first occurrence of the patched read_csv line
-    first_read_csv_end = patched.find(f"pd.read_csv(r'{safe_input}'")
-    if first_read_csv_end != -1:
-        line_end = patched.find("\n", first_read_csv_end)
-        if line_end == -1:
-            line_end = len(patched)
-        patched = patched[: line_end + 1] + SENTINEL_PRESERVE + patched[line_end + 1:]
+    # ── 2a. Prepend sentinel variable initialisation at the very top ──────────
+    # Guarantees _inference_sentinel_vals / _inference_sentinel_col are always
+    # in scope even when the capture injection below is skipped for any reason.
+    SENTINEL_INIT = (
+        f"# --- IntelliModel inference: sentinel init ---\n"
+        f"_inference_sentinel_col = {sentinel_col!r}\n"
+        f"_inference_sentinel_vals = None\n"
+        f"# ---------------------------------------------\n"
+    )
+    patched = SENTINEL_INIT + patched
 
-    # ── 2b. Patch drop_duplicates() to exclude the sentinel column ────────────
+    # ── 2b. Capture sentinel values after the try/except block ────────────────
+    # We must inject AFTER the entire try/except compound statement, not inside
+    # the try body.  Injecting between the indented try body and the `except`
+    # clause breaks Python's compound-statement grammar (SyntaxError at except).
+    #
+    # Strategy: start scanning from the patched pd.read_csv call, then skip
+    # forward past any indented or except/else/finally lines until we reach the
+    # first top-level (column-0) statement that is NOT a compound-statement
+    # continuation.  Insert SENTINEL_CAPTURE immediately before that line.
+    SENTINEL_CAPTURE = (
+        f"\n# --- IntelliModel inference: capture sentinel column ---\n"
+        f"if _inference_sentinel_col in df.columns:\n"
+        f"    _inference_sentinel_vals = df[_inference_sentinel_col].copy()\n"
+        f"# -------------------------------------------------------\n"
+    )
+    # NOTE: re.sub halves doubled backslashes when producing the replacement,
+    # so the patched code contains the original single-backslash path. We
+    # search for the r-string prefix ("pd.read_csv(r'") which is unique to
+    # the injected replacement; the original code uses pd.read_csv(variable).
+    first_read_csv_pos = patched.find("pd.read_csv(r'")
+    if first_read_csv_pos != -1:
+        scan_pos = first_read_csv_pos
+        inject_pos = None
+        while scan_pos < len(patched):
+            nl = patched.find("\n", scan_pos)
+            if nl == -1:
+                inject_pos = len(patched)
+                break
+            next_start = nl + 1
+            next_nl = patched.find("\n", next_start)
+            if next_nl == -1:
+                next_nl = len(patched)
+            line = patched[next_start:next_nl]
+            stripped = line.strip()
+            # Skip blank lines and comment-only lines
+            if not stripped or stripped.startswith("#"):
+                scan_pos = next_start
+                continue
+            if line and line[0] not in " \t":
+                # Top-level line — still skip if it is part of the try compound
+                if re.match(r"^(except|else|finally)\b", line):
+                    scan_pos = next_start
+                    continue
+                # First real top-level statement after the try/except block
+                inject_pos = next_start
+                break
+            scan_pos = next_start
+        if inject_pos is not None:
+            patched = patched[:inject_pos] + SENTINEL_CAPTURE + patched[inject_pos:]
+
+    # ── 2c. Patch drop_duplicates() to exclude the sentinel column ────────────
     # Replace df.drop_duplicates() / df.drop_duplicates(inplace=True)
     # with a version that only considers non-sentinel columns for comparison.
     patched = re.sub(
@@ -462,23 +513,31 @@ _inference_sentinel_vals = df[_inference_sentinel_col].copy() if _inference_sent
         flags=re.MULTILINE,
     )
 
-    # ── 4. Carry sentinel into the saved processed_output.csv ─────────────────
-    # Find the to_csv(...) call and prepend a snippet that re-attaches the
-    # sentinel column before saving, so we can locate the user row in output.
-    SENTINEL_REATTACH = f"""
-# --- IntelliModel inference: re-attach sentinel before saving ---
-if _inference_sentinel_vals is not None:
-    try:
-        _sentinel_aligned = _inference_sentinel_vals.reindex(df.index).fillna('')
-        df[{sentinel_col!r}] = _sentinel_aligned.values
-    except Exception:
-        pass
-# ----------------------------------------------------------------
-"""
-    # Insert before the first .to_csv( that writes processed_output.csv
-    to_csv_match = re.search(r"\.to_csv\(", patched)
+    # ── 4. Ensure sentinel column is in the DataFrame before saving ───────────
+    # Find the variable name used in the first .to_csv() call so we attach the
+    # sentinel to the correct DataFrame (may be 'df', 'output_df', etc.).
+    #
+    # CRITICAL: insert before the START OF THE LINE containing .to_csv(), NOT
+    # before the dot character itself.  The old approach split "df.to_csv(...)"
+    # into two separate statements — "df" and ".to_csv(...)" — which is invalid
+    # Python and produces "SyntaxError: invalid syntax" at the .to_csv line.
+    to_csv_match = re.search(r"(\w+)\s*\.to_csv\(", patched)
     if to_csv_match:
-        patched = patched[: to_csv_match.start()] + SENTINEL_REATTACH + patched[to_csv_match.start():]
+        save_var = to_csv_match.group(1)
+        SENTINEL_REATTACH = (
+            f"\n# --- IntelliModel inference: ensure sentinel before saving ---\n"
+            f"if _inference_sentinel_vals is not None and {sentinel_col!r} not in {save_var}.columns:\n"
+            f"    try:\n"
+            f"        _sentinel_list = list(_inference_sentinel_vals)\n"
+            f"        _sentinel_list += [''] * max(0, len({save_var}) - len(_sentinel_list))\n"
+            f"        {save_var}[{sentinel_col!r}] = _sentinel_list[:len({save_var})]\n"
+            f"    except Exception:\n"
+            f"        pass\n"
+            f"# -------------------------------------------------------------\n"
+        )
+        # rfind("\n") returns the last newline BEFORE the match → +1 = line start
+        line_start = patched.rfind("\n", 0, to_csv_match.start()) + 1
+        patched = patched[:line_start] + SENTINEL_REATTACH + patched[line_start:]
 
     return patched
 

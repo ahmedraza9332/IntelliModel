@@ -9,9 +9,9 @@ Reads the improvement memory (improvement_memory.json) to obtain:
 
 Prompts the LLM to produce an improved version of the validation code
 that incorporates the improvement steps, then saves the result to:
-  Improvement Agent/improved_training/{model_name}_improved_validation.py
+  <memory_parent>/improved_training/{model_name}_improved_validation.py
 
-KEY FIX: The prompt now strictly enforces metric printing format so the
+KEY FIX: The prompt strictly enforces metric printing format so the
 runner can always capture metrics via stdout regex (no eval() dependency).
 """
 
@@ -30,7 +30,6 @@ if str(backend_dir) not in sys.path:
 from llm_config import DEFAULT_LLM_MODEL, DEFAULT_LLM_ENDPOINT, create_chat_llm
 
 CURRENT_DIR = Path(__file__).resolve().parent
-IMPROVEMENT_MEMORY_PATH = CURRENT_DIR / "improvement_memory.json"
 
 
 def _find_improvement_memory() -> Path:
@@ -41,19 +40,13 @@ def _find_improvement_memory() -> Path:
     flat = CURRENT_DIR / "improvement_memory.json"
     if flat.exists():
         return flat
-    # Search dataset-scoped subfolders
     for sub in sorted(CURRENT_DIR.iterdir()):
         if sub.is_dir():
             candidate = sub / "improvement_memory.json"
             if candidate.exists():
                 return candidate
-    # Return flat path anyway so the error message is meaningful
     return flat
 
-
-# Resolved at runtime (not module load) so --memory CLI arg can override it.
-# Use _resolve_memory_path() inside main() instead of this constant directly.
-_DEFAULT_IMPROVEMENT_MEMORY_PATH = _find_improvement_memory()
 
 # Metric printing blocks per task type — injected verbatim into the prompt
 # so the LLM copies them exactly into the improved code.
@@ -102,7 +95,6 @@ print(f"MAPE: {mape}")
 
 def _sanitize_non_printable(text: str) -> str:
     """Remove non-printable Unicode characters that cause SyntaxErrors (e.g. U+0001 SOH)."""
-    import re
     return re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]", "", text)
 
 
@@ -134,7 +126,6 @@ def generate_improved_validation_code(
 ) -> str:
     """
     Prompt the LLM to rewrite the validation code incorporating the
-    improvement steps while keeping the same model type and evaluation logic.
     improvement steps.  The metric printing block is injected verbatim
     so the runner can always parse metrics from stdout.
     """
@@ -148,14 +139,10 @@ def generate_improved_validation_code(
                 "Improve the provided model validation/testing code by applying "
                 "ONLY the listed improvement steps. "
                 "Do NOT change the ML model type or the evaluation metric logic. "
-                "Keep the same dataset loading, train/test split strategy, and "
-                "metric printing format (MAE, MSE, R2). "
-                "Use the dataset context only for reasoning about feature names "
-                "and data characteristics. "
-                "Return ONLY valid, runnable Python code — no explanations.",
-                "Do NOT change the ML model type. "
                 "Do NOT change the train/test split ratio. "
                 "Keep the same dataset loading strategy. "
+                "Use the dataset context only for reasoning about feature names "
+                "and data characteristics. "
                 "You MUST use the EXACT metric printing block shown below — copy it "
                 "verbatim into the code, replacing any existing metric calculation and "
                 "print statements. This is mandatory for downstream metric capture.\n\n"
@@ -165,11 +152,9 @@ def generate_improved_validation_code(
             ),
             (
                 "user",
-                "Improvement steps:\n{steps}\n\n"
                 "Improvement steps to apply:\n{steps}\n\n"
                 "Dataset context:\n{dataset_context}\n\n"
                 "Current validation/testing code:\n{code}\n\n"
-                "Return only the improved Python code.",
                 "Return only the improved Python code with the mandatory metric block included.",
             ),
         ]
@@ -186,7 +171,6 @@ def generate_improved_validation_code(
             "metric_block": metric_block,
         }
     )
-    return _strip_code_fences(raw)
     return _sanitize_non_printable(_strip_code_fences(raw))
 
 
@@ -203,9 +187,7 @@ def main() -> None:
     )
     args = arg_parser.parse_args()
 
-    # ------------------------------------------------------------------
-    # Resolve the correct improvement_memory.json at RUNTIME
-    # ------------------------------------------------------------------
+    # Resolve the correct improvement_memory.json at runtime
     if args.memory:
         improvement_memory_path = Path(args.memory).expanduser().resolve()
         if not improvement_memory_path.exists():
@@ -216,16 +198,10 @@ def main() -> None:
 
     print(f"[INFO] Using improvement memory: {improvement_memory_path}")
 
-    # ------------------------------------------------------------------
-    # Load everything from improvement_memory.json
-    # ------------------------------------------------------------------
-    if not IMPROVEMENT_MEMORY_PATH.exists():
-        print(f"[ERROR] improvement_memory.json not found at: {IMPROVEMENT_MEMORY_PATH}")
     if not improvement_memory_path.exists():
         print(f"[ERROR] improvement_memory.json not found at: {improvement_memory_path}")
         sys.exit(1)
 
-    with IMPROVEMENT_MEMORY_PATH.open("r", encoding="utf-8") as f:
     with improvement_memory_path.open("r", encoding="utf-8") as f:
         mem = json.load(f)
 
@@ -236,9 +212,7 @@ def main() -> None:
     validation_code_path = mem.get("validation_code_path")
     task_type = mem.get("task_type", "regression")
 
-    # ------------------------------------------------------------------
     # Resolve improvement steps text
-    # ------------------------------------------------------------------
     if not improvement_steps and improvement_steps_path:
         p = Path(improvement_steps_path)
         if p.exists():
@@ -248,9 +222,7 @@ def main() -> None:
         print("[ERROR] No improvement steps found in memory.")
         sys.exit(1)
 
-    # ------------------------------------------------------------------
     # Load original validation code
-    # ------------------------------------------------------------------
     if not validation_code_path:
         print("[ERROR] validation_code_path missing from improvement memory.")
         sys.exit(1)
@@ -262,10 +234,7 @@ def main() -> None:
 
     validation_code = vc_path.read_text(encoding="utf-8")
 
-    # ------------------------------------------------------------------
     # Generate improved code via LLM
-    # ------------------------------------------------------------------
-    print(f"[INFO] Generating improved validation code for: {model_name}")
     print(f"[INFO] Generating improved validation code for: {model_name} (task: {task_type})")
     improved_code = generate_improved_validation_code(
         validation_code=validation_code,
@@ -274,24 +243,18 @@ def main() -> None:
         task_type=task_type,
     )
 
-    # ------------------------------------------------------------------
     # Save to improved_training/{model_name}_improved_validation.py
     # Use same parent as improvement_memory.json for dataset scoping
-    # ------------------------------------------------------------------
-    output_dir = CURRENT_DIR / "improved_training"
     output_dir = improvement_memory_path.parent / "improved_training"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_name = model_name or "model"
     safe_name = (model_name or "model").lower().replace(" ", "_").replace("-", "_")
     output_file = output_dir / f"{safe_name}_improved_validation.py"
     output_file.write_text(improved_code, encoding="utf-8")
 
     print(f"[INFO] Improved validation code saved to: {output_file}")
 
-    # ------------------------------------------------------------------
     # Write the output path back into improvement_memory.json
-    # ------------------------------------------------------------------
     try:
         with improvement_memory_path.open("r", encoding="utf-8") as f:
             mem_data = json.load(f)
